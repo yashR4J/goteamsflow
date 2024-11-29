@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+
+from scapy.all import rdpcap, IP, TCP, UDP, ICMP
+from collections import Counter
+import os
+import argparse
+
+def analyze_pcap(file_path):
+    packets = rdpcap(file_path)
+    total_packets = len(packets)
+
+    unique_ips = set()
+    unique_ports = set()
+    total_data_transferred = 0
+    protocol_counts = Counter()
+    ip_counts = Counter()
+    protocol_data_volume = {"TCP": 0, "UDP": 0, "ICMP": 0, "Other": 0}
+    total_packet_size = 0
+    first_timestamp, last_timestamp = None, None
+
+    for packet in packets:
+        if first_timestamp is None:
+            first_timestamp = packet.time
+        last_timestamp = packet.time
+
+        if IP in packet:
+            ip_layer = packet[IP]
+            unique_ips.add(ip_layer.src)
+            unique_ips.add(ip_layer.dst)
+            ip_counts[ip_layer.src] += 1
+            ip_counts[ip_layer.dst] += 1
+
+            if TCP in packet:
+                protocol_counts["TCP"] += 1
+                protocol_data_volume["TCP"] += len(packet)
+                unique_ports.add(packet[TCP].sport)
+                unique_ports.add(packet[TCP].dport)
+            elif UDP in packet:
+                protocol_counts["UDP"] += 1
+                protocol_data_volume["UDP"] += len(packet)
+                unique_ports.add(packet[UDP].sport)
+                unique_ports.add(packet[UDP].dport)
+            elif ICMP in packet:
+                protocol_counts["ICMP"] += 1
+                protocol_data_volume["ICMP"] += len(packet)
+            else:
+                protocol_counts["Other"] += 1
+                protocol_data_volume["Other"] += len(packet)
+        
+        packet_size = len(packet)
+        total_data_transferred += packet_size
+        total_packet_size += packet_size
+
+    average_packet_size = total_packet_size / total_packets if total_packets > 0 else 0
+    data_rate = (total_data_transferred / (last_timestamp - first_timestamp)) if first_timestamp and last_timestamp else 0
+
+    file_size = os.path.getsize(file_path)
+
+    top_5_ips = ip_counts.most_common(5)
+
+    return {
+        "File Size (bytes)": file_size,
+        "Total Packets": total_packets,
+        "Unique IP Hosts": len(unique_ips),
+        "Unique Ports": len(unique_ports),
+        "Total Data Transferred (bytes)": total_data_transferred,
+        "Average Packet Size (bytes)": average_packet_size,
+        "Data Rate (bytes/second)": data_rate,
+        "Protocol Counts": dict(protocol_counts),
+        "Protocol Data Volume (bytes)": protocol_data_volume,
+        "Top 5 IPs by Packet Count": top_5_ips
+    }
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument("file1", help="Path to the first pcap file")
+    parser.add_argument("file2", help="Path to the second pcap file")
+    args = parser.parse_args()
+
+    results1 = analyze_pcap(args.file1)
+    results2 = analyze_pcap(args.file2)
+
+    combined_results = {
+        "File Size (bytes)": results1["File Size (bytes)"] + results2["File Size (bytes)"],
+        "Total Packets": results1["Total Packets"] + results2["Total Packets"],
+        "Unique IP Hosts": results1["Unique IP Hosts"] + results2["Unique IP Hosts"],
+        "Unique Ports": results1["Unique Ports"] + results2["Unique Ports"],
+        "Total Data Transferred (bytes)": results1["Total Data Transferred (bytes)"] + results2["Total Data Transferred (bytes)"],
+        "Average Packet Size (bytes)": (results1["Average Packet Size (bytes)"] + results2["Average Packet Size (bytes)"]) / 2,
+        "Data Rate (bytes/second)": (results1["Data Rate (bytes/second)"] + results2["Data Rate (bytes/second)"]) / 2,
+        "Protocol Counts": Counter(results1["Protocol Counts"]) + Counter(results2["Protocol Counts"]),
+        "Protocol Data Volume (bytes)": {k: results1["Protocol Data Volume (bytes)"].get(k, 0) + results2["Protocol Data Volume (bytes)"].get(k, 0) for k in set(results1["Protocol Data Volume (bytes)"]) | set(results2["Protocol Data Volume (bytes)"])},
+        "Top 5 IPs by Packet Count": (Counter(dict(results1["Top 5 IPs by Packet Count"])) + Counter(dict(results2["Top 5 IPs by Packet Count"]))).most_common(5)
+    }
+
+    print("PCAP 1 Analysis:", results1)
+    print("PCAP 2 Analysis:", results2)
+    print("Combined Analysis:", combined_results)

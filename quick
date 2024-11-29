@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+
+import re
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import argparse
+
+def convert_time_to_seconds(time_str):
+    if isinstance(time_str, float):
+        return time_str
+    
+    if isinstance(time_str, str):
+        if "us" in time_str:
+            match = re.match(r"([\d\.]+)µs", time_str)
+            if match:
+                return float(match.group(1)) / 1_000_000.0
+        elif "ms" in time_str:
+            match = re.match(r"([\d\.]+)ms", time_str)
+            if match:
+                return float(match.group(1)) / 1000.0  
+        elif "s" in time_str:
+            match = re.match(r"([\d\.]+)s", time_str)
+            if match:
+                return float(match.group(1))  
+            
+    return None
+
+def plot_clustered_session_setup(file1, file2, output=None):
+    # Read data from both files
+    df1 = pd.read_csv(file1)
+    df2 = pd.read_csv(file2)
+
+    # Drop rows with missing session setup times or OS for each DataFrame
+    df1 = df1.dropna(subset=["Session Setup Time", "OS"]).reset_index(drop=True)
+    df2 = df2.dropna(subset=["Session Setup Time", "OS"]).reset_index(drop=True)
+
+    if df1.empty or df2.empty:
+        print("No data found in one or both files.")
+        return
+    
+    df1["Session Setup Time"] = df1["Session Setup Time"].apply(convert_time_to_seconds)
+    df2["Session Setup Time"] = df2["Session Setup Time"].apply(convert_time_to_seconds)
+
+    # Generate Session ID for aligning data by session
+    df1["Session ID"] = range(1, len(df1) + 1)
+    df2["Session ID"] = range(1, len(df2) + 1)
+
+    # Combine data into a single DataFrame for plotting
+    combined_df = pd.DataFrame({
+        "Session ID": df1["Session ID"],
+        "DNS-based Session Setup Time": df1["Session Setup Time"],
+        "STUN-based Session Setup Time": df2["Session Setup Time"]
+    })
+
+    # Plot settings for clustered bar chart
+    plt.figure(figsize=(14, 8))
+    sns.set(style="whitegrid")
+
+    # Melt the DataFrame for Seaborn compatibility with clustered bars
+    melted_df = combined_df.melt(id_vars="Session ID", 
+                                 value_vars=["DNS-based Session Setup Time", "STUN-based Session Setup Time"],
+                                 var_name="Session Setup Method", value_name="Setup Time")
+
+    # Use seaborn barplot for clustered bars with softer colors
+    sns.barplot(data=melted_df, x="Session ID", y="Setup Time", hue="Session Setup Method",
+                palette=["#7EA9C1", "#FFC078"],  # Softer blue and peach colors
+                dodge=True)  # Ensures the bars are side-by-side (clustered)
+
+    # Title and labels
+    plt.title("MS Teams Session Setup Times (DNS-based vs. STUN-based)", fontsize=16)
+    plt.xlabel("Session ID", fontsize=12)
+    plt.ylabel("Setup Time (s)", fontsize=12)
+
+    # Move the legend to the top right inside the plot area
+    plt.legend(loc="upper right", bbox_to_anchor=(0.98, 1), frameon=False)
+    
+    # Final adjustments for layout
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    # Save the plot if an output path is provided, otherwise display it
+    plt.savefig(output or "clustered_session_setup_times.png")
+    plt.show()
+
+# Example usage with argparse for command-line execution
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Clustered Bar Chart of Session Setup Times from Two Methods")
+    parser.add_argument("file1", help="Path to the first CSV file")
+    parser.add_argument("file2", help="Path to the second CSV file")
+    parser.add_argument("-o", "--output", help="Output filename for the plot", default="clustered_session_setup_times.png")
+    args = parser.parse_args()
+
+    plot_clustered_session_setup(args.file1, args.file2, args.output)

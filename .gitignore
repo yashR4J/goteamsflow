@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+build/
+test/include/
+ext/include/cxxopts/cxxopts.h
+data/
+test/*.csv
+scripts/*.csv
+scripts/archived/
+entropy/
+.vscode/
+teams_study/
+*.png
+*.csv

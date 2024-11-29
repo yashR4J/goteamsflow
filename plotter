@@ -1,0 +1,2647 @@
+#!/usr/bin/env python3
+
+import argparse
+import ipaddress
+import re
+import traceback
+
+import concurrent.futures
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.dates as mdates
+import seaborn as sns
+import pytz
+
+from collections import defaultdict
+from datetime import timedelta, datetime, time
+from scipy import stats
+from sklearn.cluster import KMeans
+
+INTERACTIVE_MODE = False
+DEBUG = False
+IP_RANGES = [
+    (ipaddress.ip_network("52.112.0.0/14"), "cloud-server"),
+    (ipaddress.ip_network("52.122.0.0/15"), "cloud-server"),
+    (ipaddress.ip_network("52.238.119.141/32"), "cloud-server"),
+    (ipaddress.ip_network("52.244.160.207/32"), "cloud-server"),
+    (ipaddress.ip_network("2603:1027::/48"), "cloud-server"),
+    (ipaddress.ip_network("2603:1037::/48"), "cloud-server"),
+    (ipaddress.ip_network("2603:1047::/48"), "cloud-server"),
+    (ipaddress.ip_network("2603:1057::/48"), "cloud-server"),
+    (ipaddress.ip_network("2603:1063::/38"), "cloud-server"),
+    (ipaddress.ip_network("2620:1ec6::/48"), "cloud-server"),
+    (ipaddress.ip_network("2620:1ec:40::/42"), "cloud-server"),
+    (ipaddress.ip_network("2620:1ec:6::/48"), "cloud-server")
+]
+
+teamsDNSRegex = re.compile(r"(^|\.)((microsoft\.com$|trafficmanager\.net$|cloudapp\.azure\.com$|office\.net$))")
+teamsTransportRelayDNSRegex = re.compile(r"(?i)(^|\.)((worldaz|uswe|euno|apse|weu)\.tr\.teams\.(microsoft\.com|office\.net)$)")
+teamsMediaRelayDNSRegex = re.compile(r"(?i)(^|\.)((.*\.relay\.teams\.(microsoft\.com|trafficmanager\.net|cloudapp\.azure\.com)$))")
+teamsFlightproxyDNSRegex = re.compile(r"(?i)(^|\.)((.*\.flightproxy\.teams\.(microsoft\.com|trafficmanager\.net|cloudapp\.azure\.com)$))")
+
+FLAG_SYN = 1 << 0
+FLAG_ACK = 1 << 1
+
+## HELPER METHODS
+
+def classify_dns_query(query, source_ip):
+    if teamsTransportRelayDNSRegex.search(query):
+        return f"Teams Transport Relay | {source_ip}"
+    elif teamsMediaRelayDNSRegex.search(query):
+        return f"Teams Media Relay | {source_ip}"
+    elif teamsFlightproxyDNSRegex.search(query):
+        return f"Teams Flightproxy | {source_ip}"
+    elif teamsDNSRegex.search(query):
+        return f"Teams DNS | {source_ip}"
+    else:
+        return "Other"
+
+def classify_rtp_flow(media_type, source_ip):
+    if "RTP Audio" in media_type:
+        return f"RTP Audio | {source_ip}"
+    elif "RTP Video" in media_type:
+        return f"RTP Video | {source_ip}"
+    elif "RTP ScreenShare" in media_type:
+        return f"RTP ScreenShare | {source_ip}"
+    return f"RTP | {source_ip}"
+
+def classify_tcp_flow(type, source_ip, source_port, dest_ip, dest_port):
+    if type == "TCP":
+        if source_port in [443, 80]:
+            return f"TCP | {source_ip}:{source_port}"
+        elif dest_port in [443, 80]:
+            return f"TCP | {dest_ip}:{dest_port}"
+    return f"TCP | {source_ip}"
+
+def classify_udp_flow(type, source_ip, source_port, dest_ip, dest_port):
+    if type == "UDP":
+        if dest_port == 3478:
+            return f"UDP | {dest_ip}:{dest_port}"
+        else:
+            return f"UDP | {source_ip}:{source_port}"
+    return f"UDP | {source_ip}"
+
+def classify_ip(ip):
+    try:
+        ip_addr = ipaddress.ip_address(ip)
+        for network, label in IP_RANGES:
+            if ip_addr in network:
+                return label
+    except ValueError:
+        pass
+    return ip
+
+def is_ip_in_teams_ranges(ip):
+    try:
+        ip_addr = ipaddress.ip_address(ip)
+        for network, _ in IP_RANGES:
+            if ip_addr in network:
+                return True
+    except ValueError:
+        print(f"Error processing IP {ip}.")
+    return False
+
+def collate_csv_data(filenames):
+    dataframes = [pd.read_csv(filename, low_memory=False) for filename in filenames]
+    combined_df = pd.concat(dataframes, ignore_index=True)
+    return combined_df
+
+def convert_time_to_seconds(time_str):
+    try:
+        if isinstance(time_str, float) or isinstance(time_str, int):
+            return time_str / 1000
+    
+        if isinstance(time_str, str):
+            if "µs" in time_str:
+                match = re.match(r"([\d\.]+)µs", time_str)
+                if match:
+                    return float(match.group(1)) / 1_000_000.0
+            elif "ms" in time_str:
+                match = re.match(r"([\d\.]+)ms", time_str)
+                if match:
+                    return float(match.group(1)) / 1000.0  
+            elif "s" in time_str:
+                match = re.match(r"([\d\.]+)s", time_str)
+                if match:
+                    return float(match.group(1))  
+            else:
+                return float(time_str) / 1000
+    except:
+        print(f"Error converting {time_str} to seconds.")
+    return None
+
+## QUANTITATIVE METRICS
+
+def quant_summary(title):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            print("-"*80)
+            print(f"--- {title.center(72, ' ')} ---")
+            print("-"*80, end="\n\n")
+            result = func(*args, **kwargs)
+            print()
+            return result
+        return wrapper
+    return decorator
+
+@quant_summary("Session Setup Times Analysis")
+def generate_session_setup_time_summary(df, initial_calls_df):
+    def print_percentile(p, value):
+        if value < 1:
+            print(f"  {p:.0f}th percentile: {value * 1000:.2f} milliseconds")
+        else:
+            print(f"  {p:.0f}th percentile: {value:.2f} seconds")
+
+    total_calls = len(df)
+    initial_calls = len(initial_calls_df)
+    subsequent_calls = total_calls - initial_calls
+
+    initial_call_percentage = (initial_calls / total_calls) * 100 if total_calls > 0 else 0
+    subsequent_call_percentage = (subsequent_calls / total_calls) * 100 if total_calls > 0 else 0
+
+    # Mean setup times
+    initial_mean_setup_time = initial_calls_df["Session Setup Time"].mean() if initial_calls > 0 else 0
+    subsequent_calls_df = df[df["Session Setup Type"] == "Subsequent Media"]
+    subsequent_mean_setup_time = subsequent_calls_df["Session Setup Time"].mean() if subsequent_calls > 0 else 0
+
+    percentiles = [25, 50, 75, 90, 95]
+    initial_percentiles = (
+        initial_calls_df["Session Setup Time"]
+        .quantile([p / 100 for p in percentiles])
+        .to_dict() if initial_calls > 0 else {p / 100: 0 for p in percentiles}
+    )
+    subsequent_percentiles = (
+        subsequent_calls_df["Session Setup Time"]
+        .quantile([p / 100 for p in percentiles])
+        .to_dict() if subsequent_calls > 0 else {p / 100: 0 for p in percentiles}
+    )
+
+    initial_calls_under_2s = len(initial_calls_df[initial_calls_df["Session Setup Time"] < 2])
+    subsequent_calls_under_2s = len(subsequent_calls_df[subsequent_calls_df["Session Setup Time"] < 2])
+
+    confidence_level = 0.95
+    alpha = 1 - confidence_level
+
+    if initial_calls > 1:
+        initial_std = initial_calls_df["Session Setup Time"].std()
+        initial_sem = initial_std / np.sqrt(initial_calls)
+        degrees_freedom = initial_calls - 1
+        initial_t_critical = stats.t.ppf(1 - alpha/2, df=degrees_freedom)
+        initial_margin_of_error = initial_t_critical * initial_sem
+        initial_confidence_interval = (
+            initial_mean_setup_time - initial_margin_of_error,
+            initial_mean_setup_time + initial_margin_of_error
+        )
+    else:
+        initial_confidence_interval = (initial_mean_setup_time, initial_mean_setup_time)
+
+    if subsequent_calls > 1:
+        subsequent_std = subsequent_calls_df["Session Setup Time"].std()
+        subsequent_sem = subsequent_std / np.sqrt(subsequent_calls)
+        degrees_freedom = subsequent_calls - 1
+        subsequent_t_critical = stats.t.ppf(1 - alpha/2, df=degrees_freedom)
+        subsequent_margin_of_error = subsequent_t_critical * subsequent_sem
+        subsequent_confidence_interval = (
+            subsequent_mean_setup_time - subsequent_margin_of_error,
+            subsequent_mean_setup_time + subsequent_margin_of_error
+        )
+    else:
+        subsequent_confidence_interval = (subsequent_mean_setup_time, subsequent_mean_setup_time)
+
+    print(f"Total Calls: {total_calls}")
+    print(f"Number of Initial Calls: {initial_calls}")
+    print(f"Number of Subsequent Calls: {subsequent_calls}")
+    print(f"Percentage of Initial Calls: {initial_call_percentage:.2f}%")
+    print(f"Percentage of Subsequent Calls: {subsequent_call_percentage:.2f}%")
+    print(f"Mean Setup Time for Initial Calls: {initial_mean_setup_time:.2f} seconds")
+    print(f"95% Confidence Interval for Initial Calls Mean: ({initial_confidence_interval[0]:.2f}, {initial_confidence_interval[1]:.2f}) seconds")
+    print(f"Mean Setup Time for Subsequent Calls: {subsequent_mean_setup_time:.2f} seconds")
+    print(f"95% Confidence Interval for Subsequent Calls Mean: ({subsequent_confidence_interval[0]:.2f}, {subsequent_confidence_interval[1]:.2f}) seconds")
+    print(f"Number of Initial Calls Under 2 Seconds: {initial_calls_under_2s}")
+    print(f"Number of Subsequent Calls Under 2 Seconds: {subsequent_calls_under_2s}")
+
+    print("\nInitial Call Setup Time Percentiles:")
+    for p, value in initial_percentiles.items():
+        print_percentile(p * 100, value)
+    print("\nSubsequent Call Setup Time Percentiles:")
+    for p, value in subsequent_percentiles.items():
+        print_percentile(p * 100, value)
+
+    # Generate boxplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    ax1.boxplot(initial_calls_df["Session Setup Time"].dropna())
+    ax1.set_title("Session Setup Times (Initial Call Setup)")
+    ax1.set_ylabel("Setup Time (seconds)")
+    ax1.set_xticks([])
+    ax1.set_xlabel("")
+
+    ax2.boxplot(subsequent_calls_df["Session Setup Time"].dropna())
+    ax2.set_title("Session Setup Times (Subsequent Media Channel Setup)")
+    ax2.set_ylabel("Setup Time (seconds)")
+    ax2.set_xticks([])
+    ax2.set_xlabel("")
+
+    plt.tight_layout()
+    plt.savefig("boxplot.png")
+
+    return {
+        "total_calls": total_calls,
+        "initial_calls": initial_calls,
+        "subsequent_calls": subsequent_calls,
+        "initial_call_percentage": initial_call_percentage,
+        "subsequent_call_percentage": subsequent_call_percentage,
+        "initial_mean_setup_time": initial_mean_setup_time,
+        "initial_confidence_interval": initial_confidence_interval,
+        "subsequent_mean_setup_time": subsequent_mean_setup_time,
+        "subsequent_confidence_interval": subsequent_confidence_interval,
+        "initial_percentiles": initial_percentiles,
+        "subsequent_percentiles": subsequent_percentiles
+    }
+
+@quant_summary("Media Type Distribution Analysis")
+def generate_media_distribution_summary(df, media_counts):
+    total_sessions = len(df)
+    media_metrics = media_counts.to_dict()
+    media_percentages = {media_type: (count / total_sessions) * 100 for media_type, count in media_metrics.items()}
+    
+    print(f"Total Packets: {total_sessions}")
+    print("Media Type Counts:")
+    for media_type, count in media_metrics.items():
+        print(f"  {media_type}: {count} packets ({media_percentages[media_type]:.2f}%)")
+
+    return {
+        "total_sessions": total_sessions,
+        "media_counts": media_metrics,
+        "media_percentages": media_percentages
+    }
+
+@quant_summary("Session Setup Times over 24 hour period Analysis")
+def generate_setup_time_over_day_summary(df):
+    summary_metrics = {
+        "Mean Setup Time (s)": df["Session Setup Time"].mean(),
+        "Median Setup Time (s)": df["Session Setup Time"].median(),
+        "Min Setup Time (s)": df["Session Setup Time"].min(),
+        "Max Setup Time (s)": df["Session Setup Time"].max(),
+        "Standard Deviation (s)": df["Session Setup Time"].std(),
+    }
+
+    for metric, value in summary_metrics.items():
+        print(f"{metric}: {value:.2f}")
+
+    return summary_metrics
+
+@quant_summary("Call Abandonment Rate Analysis")
+def calculate_call_abandonment_rate(df):
+    """
+    Calculates the call abandonment rate, defined as "Session Initiation" requests 
+    that do not have a corresponding "Session Established" response within 30 seconds,
+    grouped by the same Source IP, and ignores initiation attempts for a short timeout 
+    period of 10s after a session was previously established.
+    """
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df = df.sort_values(by="Timestamp")
+
+    session_setup_rows = df[df["Type"] == "Session Setup"]
+
+    abandonment_threshold = 30 # assume max session setup time of 30s
+    call_duration = args.threshold
+    calls_connected = 0
+    abandoned_calls = 0
+
+    for _, group in session_setup_rows.groupby("Source IP"):
+        group = group.sort_values(by="Timestamp")
+        last_established_time = None  
+        for _, row in group.iterrows():
+            if row["State"] == "Established": # and row["Session Setup Type"] == "Initial Setup":
+                last_established_time = row["Timestamp"]
+                calls_connected += 1 if row["Session Setup Type"] == "Initial Setup" else 0
+            
+            elif row["State"] == "Connecting":
+                # if a previous session was established, do not search for subsequent sessions in the next five minutes
+                if last_established_time and (row["Timestamp"] <= last_established_time + timedelta(seconds=call_duration)):
+                    continue
+
+                # new call detected
+                session_time = row["Timestamp"]
+
+                # check if the call has been established within the abandonment_threshold period
+                subsequent_established = group[
+                    (group["Session Setup Type"] == "Initial Setup") &
+                    (group["State"] == "Established") &
+                    (group["Timestamp"] > session_time) &
+                    (group["Timestamp"] <= session_time + timedelta(seconds=abandonment_threshold))
+                ]
+                
+                if subsequent_established.empty:
+                    abandoned_calls += 1
+
+    # Calculate abandonment rate
+    total_initiated_calls = abandoned_calls + calls_connected
+    abandonment_rate = (abandoned_calls / total_initiated_calls) * 100 if total_initiated_calls > 0 else 0
+
+    print(f"Total Calls Connected: {calls_connected}")
+    print(f"Total Abandoned Calls: {abandoned_calls}")
+    print(f"Total Initiated Calls: {total_initiated_calls}")
+    print(f"Call abandonment rate: {abandonment_rate:.2f}%")
+    return abandonment_rate
+
+@quant_summary("RTP Jitter Metrics Summary")
+def generate_jitter_metrics_summary(rtp_packets):
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    media_types = ["Audio", "Video", "ScreenShare"]
+
+    summary_by_date_and_media = {}
+    for date in dates_of_interest:
+        date_summary = {}
+        date_packets = rtp_packets[rtp_packets["Timestamp"].dt.date == pd.to_datetime(date).date()]
+        for media_type in media_types:
+            media_packets = date_packets[date_packets["Media Type"].str.contains(media_type, case=False, na=False)]
+            if not media_packets.empty:
+                media_summary = {
+                    "Mean Jitter (ms)": media_packets["Jitter (ms)"].mean(),
+                    "Median Jitter (ms)": media_packets["Jitter (ms)"].median(),
+                    "Max Jitter (ms)": media_packets["Jitter (ms)"].max(),
+                    "Standard Deviation Jitter (ms)": media_packets["Jitter (ms)"].std(),
+                    "90th Percentile Jitter (ms)": media_packets["Jitter (ms)"].quantile(0.9),
+                    "95th Percentile Jitter (ms)": media_packets["Jitter (ms)"].quantile(0.95)
+                }
+                date_summary[media_type] = media_summary
+                print(f"\n{date} {media_type} Jitter Metrics Summary:")
+                for metric, value in media_summary.items():
+                    print(f"{metric}: {value:.2f}")
+        summary_by_date_and_media[date] = date_summary
+    return summary_by_date_and_media
+
+@quant_summary("Latency Metrics Summary")
+def generate_latency_metrics_summary(tcp_packets):
+    def print_percentile(value):
+        if value < 1:
+            print(f"  {p * 100:.0f}th percentile: {value * 1000:.2f} milliseconds")
+        else:
+            print(f"  {p * 100:.0f}th percentile: {value:.2f} seconds")
+
+    summary = {
+        "Mean Latency (ms)": tcp_packets["Latency"].mean(),
+        "Median Latency (ms)": tcp_packets["Latency"].median(),
+        "Max Latency (ms)": tcp_packets["Latency"].max(),
+        "Standard Deviation Latency (ms)": tcp_packets["Latency"].std(),
+        "90th Percentile Latency (ms)": tcp_packets["Latency"].quantile(0.9),
+        "95th Percentile Latency (ms)": tcp_packets["Latency"].quantile(0.95)
+    }
+    
+    print("Overall Latency Metrics Summary:")
+    for metric, value in summary.items():
+        print(f"{metric}: {value:.2f}")
+    
+        # Time ranges for additional analysis
+    
+    total_above_60ms_count = tcp_packets[tcp_packets["Latency"] > 60].shape[0]
+    total_percentage_above_60ms = (total_above_60ms_count / len(tcp_packets)) * 100
+    print(f"\nTotal Percentage of packets above 60 ms latency: {total_percentage_above_60ms:.2f}%")
+    
+    time_ranges = [("10:00:00", "12:00:00"), ("14:00:00", "16:00:00")]
+
+    for start_time, end_time in time_ranges:
+        range_start = pd.to_datetime(start_time).time()
+        range_end = pd.to_datetime(end_time).time()
+        
+        packets_in_time_range = tcp_packets[
+            (tcp_packets["Timestamp"].dt.time >= range_start) &
+            (tcp_packets["Timestamp"].dt.time <= range_end)
+        ]
+        
+        if not packets_in_time_range.empty:
+            above_60ms_count = packets_in_time_range[packets_in_time_range["Latency"] > 60].shape[0]
+            percentage_above_60ms = (above_60ms_count / len(packets_in_time_range)) * 100
+            print(f"\nPercentage of packets above 60 ms latency between {start_time} - {end_time}: {percentage_above_60ms:.2f}%")
+        else:
+            print(f"\nNo packets found between {start_time} - {end_time}.")
+
+    # if not tcp_packets.empty:
+    #     percentiles = [25, 50, 75, 90, 95]
+    #     initial_percentiles = (
+    #         tcp_packets.empty["Latency"]
+    #         .quantile([p / 100 for p in percentiles])
+    #         .to_dict() if len(tcp_packets) > 0 else {p: 0 for p in percentiles}
+    #     )
+
+    #     for p, value in initial_percentiles.items():
+    #         print_percentile(value)
+
+    #     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    #     ax1.boxplot(tcp_packets.empty["Latency"].dropna())
+    #     ax1.set_title("TCP One-Way Latency Distribution")
+    #     ax1.set_ylabel("Latency (ms)")
+    #     ax1.set_xticks([])  
+    #     ax1.set_xlabel("")
+
+    #     plt.tight_layout()
+    #     plt.savefig("boxplot.png")
+
+@quant_summary("TCP Retransmission Metrics Summary")
+def generate_retransmission_metrics_summary(tcp_packets):
+    summary = {
+        "Total Retransmissions": tcp_packets["Retransmission Count"].sum(),
+        "Mean Retransmissions per Second": tcp_packets.groupby(tcp_packets["Timestamp"].dt.floor("1s"))["Retransmission Count"].sum().mean(),
+        "Max Retransmissions in a Second": tcp_packets.groupby(tcp_packets["Timestamp"].dt.floor("1s"))["Retransmission Count"].sum().max(),
+        "Retransmission Rate": (tcp_packets["Retransmission Rate"].sum() / len(tcp_packets)) * 100 if len(tcp_packets) > 0 else 0
+    }
+    for metric, value in summary.items():
+        print(f"{metric}: {value:.2f}")
+    return summary
+
+@quant_summary("Bandwidth Metrics Summary")
+def generate_bandwidth_metrics_summary(bandwidth_data):
+    def format_bandwidth(value):
+        if value >= 1e9:
+            return f"{value / 1e9:.2f} Gbps"
+        elif value >= 1e6: 
+            return f"{value / 1e6:.2f} Mbps"
+        elif value >= 1e3: 
+            return f"{value / 1e3:.2f} Kbps"
+        else: 
+            return f"{value:.2f} bps"
+
+    # Overall summary
+    summary = {
+        "Mean Bandwidth": bandwidth_data["Bandwidth"].mean(),
+        "Max Bandwidth": bandwidth_data["Bandwidth"].max(),
+        "Standard Deviation Bandwidth": bandwidth_data["Bandwidth"].std()
+    }
+    
+    for metric, value in summary.items():
+        formatted_value = format_bandwidth(value)
+        print(f"{metric}: {formatted_value}")
+    
+    # Media type summary
+    media_types = ["Audio", "Video", "ScreenShare"]
+    targets = [0.5, 4, 2.5]
+    summary_by_media = {}
+
+    for i, media_type in enumerate(media_types):
+        media_packets = bandwidth_data[bandwidth_data["Media Type"].str.contains(media_type, case=False, na=False)]
+        if not media_packets.empty:
+            media_summary = {
+                "Mean Bandwidth": media_packets["Bandwidth"].mean(),
+                "Median Bandwidth": media_packets["Bandwidth"].median(),
+                "Max Bandwidth": media_packets["Bandwidth"].max(),
+                "Standard Deviation Bandwidth": media_packets["Bandwidth"].std(),
+                "90th Percentile Bandwidth": media_packets["Bandwidth"].quantile(0.9),
+                "95th Percentile Bandwidth": media_packets["Bandwidth"].quantile(0.95),
+                "Percentile Exceeding Target": (media_packets["Bandwidth (Mbps)"] > targets[i]).mean() * 100
+            }
+            summary_by_media[media_type] = media_summary
+            
+            print(f"\n{media_type} Bandwidth Metrics Summary:")
+            for metric, value in media_summary.items():
+                formatted_value = format_bandwidth(value)
+                print(f"{metric}: {formatted_value}")
+
+    # Additional summaries for specific time ranges
+    time_ranges = [(time(10, 0), time(12, 0)), (time(14, 0), time(16, 0))]
+
+    for start, end in time_ranges:
+        print(f"\nBandwidth Metrics for Time Range {start} - {end}:")
+        
+        # Filter data for each time range
+        time_filtered_data = bandwidth_data[
+            (bandwidth_data["Timestamp"].dt.time >= start) & 
+            (bandwidth_data["Timestamp"].dt.time <= end)
+        ]
+
+        for i, media_type in enumerate(media_types):
+            media_packets = time_filtered_data[
+                time_filtered_data["Media Type"].str.contains(media_type, case=False, na=False)
+            ]
+            if not media_packets.empty:
+                media_summary = {
+                    "Mean Bandwidth": media_packets["Bandwidth"].mean(),
+                    "Median Bandwidth": media_packets["Bandwidth"].median(),
+                    "Max Bandwidth": media_packets["Bandwidth"].max(),
+                    "Standard Deviation Bandwidth": media_packets["Bandwidth"].std(),
+                    "90th Percentile Bandwidth": media_packets["Bandwidth"].quantile(0.9),
+                    "95th Percentile Bandwidth": media_packets["Bandwidth"].quantile(0.95),
+                    "Percentile Exceeding Target": (media_packets["Bandwidth (Mbps)"] > targets[i]).mean() * 100
+                }
+                summary_by_media[f"{media_type}_{start}-{end}"] = media_summary
+                
+                print(f"\n{media_type} Bandwidth Metrics Summary for {start} - {end}:")
+                for metric, value in media_summary.items():
+                    formatted_value = format_bandwidth(value)
+                    print(f"{metric}: {formatted_value}")
+
+    return summary_by_media
+
+@quant_summary("ICE Renegotiation Attempts Summary")
+def generate_renegotiation_attempts_summary(renegotiation_counts):
+    summary = {
+        "Mean Renegotiation Attempts": renegotiation_counts["Renegotiation Attempts"].mean(),
+        "Max Renegotiation Attempts": renegotiation_counts["Renegotiation Attempts"].max(),
+        "Standard Deviation of Renegotiations": renegotiation_counts["Renegotiation Attempts"].std()
+    }
+    
+    for metric, value in summary.items():
+        print(f"{metric}: {value:.2f}")
+    
+    return summary
+
+@quant_summary("Media Type Combination Metrics Summary")
+def generate_media_type_metrics_summary(summary_df):
+    combinations = {
+        "Audio only": ["Audio"],
+        "Video only": ["Video"],
+        "Screenshare only": ["ScreenShare"],
+        "Audio and Video": ["Audio", "Video"],
+        "Audio and Screenshare": ["Audio", "ScreenShare"],
+        "Video and Screenshare": ["Video", "ScreenShare"],
+        "Audio, Video, and Screenshare": ["Audio", "Video", "ScreenShare"]
+    }
+    
+    combination_counts = {key: 0 for key in combinations.keys()}
+    
+    total_calls = len(summary_df)
+
+    for media_types in summary_df['Media Types']:
+        for combo_name, combo_types in combinations.items():
+            if set(combo_types) == set(media_types):
+                combination_counts[combo_name] += 1
+
+    print(f"Total Calls Detected: {total_calls}")
+    for combo_name, count in combination_counts.items():
+        percentage = (count / total_calls) * 100 if total_calls > 0 else 0
+        print(f"{combo_name}: {count} calls ({percentage:.2f}%)")
+    
+    media_type_counts = {
+        "Audio": sum(1 for media in summary_df['Media Types'] if "Audio" in media),
+        "Video": sum(1 for media in summary_df['Media Types'] if "Video" in media),
+        "Screenshare": sum(1 for media in summary_df['Media Types'] if "ScreenShare" in media)
+    }
+    
+    print("\nPercentage of Calls Involving Each Media Type:")
+    for media_type, count in media_type_counts.items():
+        percentage = (count / total_calls) * 100 if total_calls > 0 else 0
+        print(f"{media_type}: {count} calls ({percentage:.2f}%)")
+    
+    return {
+        "total_calls": total_calls,
+        "combination_counts": combination_counts,
+        "media_type_counts": media_type_counts
+    }
+
+## PLOTTER METHODS
+
+def plot_session_setup(df):
+    os_colors = {
+        "Windows": "blue",
+        "macOS": "green",
+        "Linux": "red",
+        "Unknown": "gray"
+    }
+
+    df = df.dropna(subset=["Session Setup Time", "OS"])
+    if df.empty:
+        print("No data found")
+        return
+
+    df["Session ID"] = range(1, len(df) + 1)
+
+    plt.figure(figsize=(10, 6))
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={"height_ratios": [2, 1]})
+
+    ax1.scatter(df["Session ID"], df["Session Setup Time"], color="blue", alpha=0.6, s=15)
+    ax1.set_title(f"MS Teams Session Setup Times ({'ICE/STUN-based' if args.method == 2 else 'DNS-based'})", fontsize=16)
+    ax1.set_xlabel("Session ID", fontsize=12)
+    ax1.set_ylabel("Setup Time (s)", fontsize=12)
+    ax1.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax1.set_xticks(range(0, len(df) + 1, max(1, len(df) // 20)))  
+    ax1.tick_params(axis="both", which="major", labelsize=10)
+
+    sns.histplot(df["Session Setup Time"], kde=True, ax=ax2, bins=30, color="blue", alpha=0.3)
+    ax2.set_title(f"Distribution of Session Setup Times ({'ICE/STUN-based' if args.method == 2 else 'DNS-based'})", fontsize=16)
+    ax2.set_xlabel("Setup Time (s)", fontsize=12)
+    ax2.set_ylabel("Frequency", fontsize=12)
+    ax2.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax2.tick_params(axis="both", which="major", labelsize=10)
+
+    plt.tight_layout()
+    plt.savefig(args.output or "session_setup_times.png")
+    
+    return generate_session_setup_time_summary(df, df)
+        
+def plot_session_setup_by_os(df):
+    os_colors = {
+        "Windows": "blue",
+        "macOS": "green",
+        "Linux": "red",
+        "Unknown": "gray"
+    }
+
+    df = df.dropna(subset=["Session Setup Time", "OS"])
+    if df.empty:
+        print("No data found")
+        return
+
+    df["Session ID"] = range(1, len(df) + 1)
+    df["OS"] = df["OS"].fillna("Unknown")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={"height_ratios": [2, 1]})
+
+    for os_type, color in os_colors.items():
+        os_data = df[df["OS"] == os_type]
+        ax1.scatter(
+            os_data["Session ID"],
+            os_data["Session Setup Time"],
+            label=os_type,
+            color=color,
+            alpha=0.6,
+            s=15
+        )
+
+    ax1.set_title("MS Teams Session Setup Times by OS Type", fontsize=16)
+    ax1.set_xlabel("Session ID", fontsize=12)
+    ax1.set_ylabel("Setup Time (s)", fontsize=12)
+    ax1.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax1.legend(title="OS Type", fontsize=10)
+    ax1.set_xticks(range(0, len(df) + 1, max(1, len(df) // 20)))
+    ax1.tick_params(axis="both", which="major", labelsize=10)
+
+    for os_type, color in os_colors.items():
+        os_data = df[df["OS"] == os_type]
+        if not os_data.empty:
+            sns.histplot(os_data["Session Setup Time"], ax=ax2, label=os_type, color=color, alpha=0.3, bins=30, kde=True)
+
+    ax2.set_title("Distribution of Session Setup Times by OS Type", fontsize=16)
+    ax2.set_xlabel("Setup Time (s)", fontsize=12)
+    ax2.set_ylabel("Frequency", fontsize=12)
+    ax2.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax2.legend(title="OS Type", fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(args.output or "session_setup_times_by_os_type.png")
+    plt.close()
+
+    return generate_session_setup_time_summary(df, df)
+
+def plot_session_setup_k_means(df):
+    os_colors = {
+        "Windows": "blue",
+        "macOS": "green",
+        "Linux": "red",
+        "Unknown": "gray"
+    }
+
+    df = df.dropna(subset=["Session Setup Time", "OS"])
+    if df.empty:
+        print("No data found")
+        return
+
+    df["Session ID"] = range(1, len(df) + 1)
+
+    plt.figure(figsize=(14, 8))
+
+    # Use 2 clusters: one for initial setup and one for subsequent media
+    kmeans = KMeans(n_clusters=2, random_state=0)
+    df["Cluster"] = kmeans.fit_predict(df[["Session Setup Time"]])
+
+    cluster_means = df.groupby("Cluster")["Session Setup Time"].mean()
+    initial_setup_cluster = cluster_means.idxmax()  # Cluster with higher mean represents initial setups
+    subsequent_media_cluster = cluster_means.idxmin()  # Cluster with lower mean represents subsequent media
+    df["Session Setup Type"] = df["Cluster"].replace({
+        initial_setup_cluster: "Initial Setup",
+        subsequent_media_cluster: "Subsequent Media"
+    })
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={"height_ratios": [2, 1]})
+
+    sns.scatterplot(
+        x="Session ID",
+        y="Session Setup Time",
+        hue="Session Setup Type",
+        data=df,
+        palette={"Initial Setup": "blue", "Subsequent Media": "red"},
+        alpha=0.6,
+        s=15,
+        ax=ax1
+    )
+    ax1.set_title("MS Teams Session Setup Times (Clustered)", fontsize=16)
+    ax1.set_xlabel("Session ID", fontsize=12)
+    ax1.set_ylabel("Setup Time (s)", fontsize=12)
+    ax1.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax1.tick_params(axis="both", which="major", labelsize=10)
+    ax1.legend(title="Session Setup Type", loc="upper right")
+
+    centroids = kmeans.cluster_centers_.flatten()
+    for idx, centroid in enumerate(centroids):
+        label = "Initial Setup Centroid" if idx == initial_setup_cluster else "Subsequent Media Centroid"
+        ax1.axhline(y=centroid, color="black", linestyle="--", linewidth=1, label=label)
+
+    ax1.legend(loc="upper right")
+    
+    for category, color in zip(["Initial Setup", "Subsequent Media"], ["blue", "red"]):
+        sns.histplot(df[df["Session Setup Type"] == category]["Session Setup Time"], kde=True, ax=ax2, bins=30, color=color, label=category, alpha=0.3)
+        
+    ax2.set_title("Distribution of Session Setup Times (ICE/STUN Method)", fontsize=16)
+    ax2.set_xlabel("Setup Time (s)", fontsize=12)
+    ax2.set_ylabel("Frequency", fontsize=12)
+    ax2.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax2.tick_params(axis="both", which="major", labelsize=10)
+    ax2.legend(title="Session Setup Type", loc="upper right")
+
+    plt.tight_layout()
+    plt.savefig(args.output or "session_setup_times_clustered.png")
+
+    initial_calls_df = df[df["Session Setup Type"] == "Initial Setup"]
+    if not initial_calls_df.empty:
+        plt.figure(figsize=(10, 6))
+        sns.histplot(
+            initial_calls_df["Session Setup Time"],
+            kde=True,
+            bins=30,
+            color="blue",
+            alpha=0.6
+        )
+        plt.title("Initial Call Setup Times", fontsize=16)
+        plt.xlabel("Setup Time (s)", fontsize=12)
+        plt.ylabel("Frequency", fontsize=12)
+        plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        plt.tight_layout()
+        plt.savefig("1_" + args.output if args.output else "initial_call_setup_times.png")
+        plt.close()
+
+    return generate_session_setup_time_summary(df, initial_calls_df)
+
+def plot_session_setup_time_based(df):
+    os_colors = {
+        "Windows": "blue",
+        "macOS": "green",
+        "Linux": "red",
+        "Unknown": "gray"
+    }
+
+    # Filter out rows with NaN values in critical columns
+    df = df.dropna(subset=["Session Setup Time", "OS"])
+    if df.empty:
+        print("No data found")
+        return
+
+    df["Session ID"] = range(1, len(df) + 1)
+
+    plt.figure(figsize=(14, 8))
+    df = df.sort_values(["Source IP", "Timestamp"])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={"height_ratios": [2, 1]})
+
+    # Scatter plot for session setup times
+    sns.scatterplot(
+        x="Session ID",
+        y="Session Setup Time",
+        hue="Session Setup Type",
+        data=df,
+        palette={"Initial Setup": "blue", "Subsequent Media": "red"},
+        alpha=0.6,
+        s=15,
+        ax=ax1
+    )
+    ax1.set_title("MS Teams Session Setup Times (Time-Based Heuristics)", fontsize=16)
+    ax1.set_xlabel("Session ID", fontsize=12)
+    ax1.set_ylabel("Setup Time (s)", fontsize=12)
+    ax1.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax1.tick_params(axis="both", which="major", labelsize=10)
+    ax1.legend(title="Session Setup Type", loc="upper right")
+
+    # Separate histograms for "Initial Setup" and "Subsequent Media"
+    initial_setup_times = df[df["Session Setup Type"] == "Initial Setup"]["Session Setup Time"]
+    subsequent_media_times = df[df["Session Setup Type"] == "Subsequent Media"]["Session Setup Time"]
+
+    sns.histplot(
+        initial_setup_times, kde=True, ax=ax2, bins=30, color="blue", label="Initial Setup", alpha=0.3, kde_kws={"bw_adjust": 0.8}
+    )
+
+    # Setting axis limits if needed to improve visibility
+    ax2.set_xlim(0, max(df["Session Setup Time"].max(), 10))
+    
+    ax2.set_title("Distribution of Session Setup Times (Initial Call Setup)", fontsize=16)
+    ax2.set_xlabel("Setup Time (s)", fontsize=12)
+    ax2.set_ylabel("Frequency", fontsize=12)
+    ax2.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax2.tick_params(axis="both", which="major", labelsize=10)
+    ax2.legend(title="Session Setup Type", loc="upper right")
+
+    plt.tight_layout()
+    plt.savefig("session_setup_times_time_based.png")
+    plt.close()
+
+    # Additional plot for Initial Setup times if needed
+    initial_calls_df = df[df["Session Setup Type"] == "Initial Setup"]
+    if not initial_calls_df.empty:
+        plt.figure(figsize=(10, 6))
+        sns.histplot(
+            initial_calls_df["Session Setup Time"],
+            kde=True,
+            bins=30,
+            color="blue",
+            alpha=0.6
+        )
+        plt.title("Initial Call Setup Times", fontsize=16)
+        plt.xlabel("Setup Time (s)", fontsize=12)
+        plt.ylabel("Frequency", fontsize=12)
+        plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        plt.tight_layout()
+        plt.savefig("initial_call_setup_times.png")
+        plt.close()
+    
+    return generate_session_setup_time_summary(df, initial_calls_df)
+
+def plot_volumetric_flows(df, window=100, title="MS Teams Conferencing Volumetric Flows and Session Setup Times"):
+    """
+    Plots volumetric flows of different packet types over a single reference day (ignoring the date).
+    """
+    df["Timestamp"] = df["Timestamp"].apply(lambda dt: dt.replace(year=2025, month=9, day=10))
+    df = df.sort_values("Timestamp")
+
+    fig, ax1 = plt.subplots(figsize=(14, 4), constrained_layout=True)
+
+    for flow_type, flow_data in df.groupby("Type"):
+        if flow_type == "Session Setup":
+            continue
+
+        flow_data = flow_data.set_index("Timestamp").resample("1min").size()
+        smoothed_pps = flow_data.rolling(window=window, min_periods=1).mean().interpolate()
+
+        ax1.plot(
+            smoothed_pps.index, 
+            smoothed_pps.values, 
+            label=flow_type, linestyle="-", alpha=0.7, linewidth=1.5
+        )
+
+    
+    ax1.set_xlabel("Time of Day", fontsize=12)
+    ax1.set_ylabel("Packets per Second (pps)", fontsize=12)
+    ax1.set_title(title if not args.peakhour else "MS Teams Conferencing Volumetric Flows and Session Setup Times", fontsize=12)
+
+    time_range = df["Timestamp"].max() - df["Timestamp"].min()
+
+    if time_range <= pd.Timedelta("1 hour"):
+        ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
+        ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=1))
+    elif time_range <= pd.Timedelta("6 hours"):
+        ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=15))
+        ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=5))
+    elif time_range <= pd.Timedelta("1 day"):
+        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+    else:
+        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+        ax1.xaxis.set_minor_locator(mdates.MinuteLocator(interval=30))
+    
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    ax1.tick_params(axis="x", rotation=45)
+    ax1.grid(True, linestyle="--", linewidth=0.5)
+    ax1.set_ylim(bottom=0)
+
+    ax2 = ax1.twinx()
+    session_setup_times = df[(df["Type"] == "Session Setup") & (df["Session Setup Type"] == "Initial Setup")].copy()
+    if len(session_setup_times) > 0:
+        session_setup_times = session_setup_times.dropna(subset=["Session Setup Time"])
+        ax2.scatter(
+            session_setup_times["Timestamp"],
+            session_setup_times["Session Setup Time"],
+            color="red",
+            alpha=0.5,
+            label="Session Setup Time Distribution",
+            s=20
+        )
+
+        ax2.set_ylabel("Session Setup Time (seconds)", color="red", fontsize=12)
+        ax2.set_xlim(ax1.get_xlim())
+        ax2.set_ylim(bottom=0)
+        ax2.tick_params(axis="y", colors="red")
+
+    flow_legend = ax1.legend(loc="center left", bbox_to_anchor=(1.07,0.5), title="Flow Types", fontsize=10)
+    ax1.add_artist(flow_legend)
+
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    plt.savefig("volumetric_flows_with_sessions.png")
+    plt.close()
+
+def plot_call_flow(df):
+    """
+    Plots a call flow diagram showing the sequence of different flow types.
+    """
+    flow_mapping = {
+        "DNS": "DNS",
+        "RTP Audio": "RTP Audio",
+        "RTP Video": "RTP Video",
+        "RTP ScreenShare": "RTP ScreenShare",
+        "RTCP": "RTCP",
+        "Upstream TCP": "TCP",
+        "Upstream UDP": "UDP",
+        "Downstream TCP": "TCP",
+        "Downstream UDP": "UDP",
+        "STUN": "STUN"
+    }
+
+    color_mapping = {
+        "DNS": "blue",
+        "RTP Audio": "green",
+        "RTP Video": "orange",
+        "RTP ScreenShare": "purple",
+        "RTCP": "lightgreen",
+        "STUN": "lightgray",
+        "TCP": "red",
+        "UDP": "cyan"
+    }
+
+    df["Flow_Label"] = ""
+
+    # Process DNS
+    mask_dns = df["Type"] == "DNS"
+    if mask_dns.any():
+        df.loc[mask_dns, "Flow_Label"] = df.loc[mask_dns].apply(
+            lambda row: classify_dns_query(row["Query"], classify_ip(row["Source IP"])), axis=1
+        )
+    
+    # mask_dns = df["Type"] == "DNS"
+    # if mask_dns.any():
+    #     df.loc[mask_dns, "Flow_Label"] = df.loc[mask_dns].apply(
+    #         lambda row: f"DNS | {sorted([classify_ip(row['Source IP']), classify_ip(row['Destination IP'])])}", axis=1
+    #     )
+
+    mask_rtp = df["Type"].str.contains("RTP", na=False)
+    if mask_rtp.any():
+        df.loc[mask_rtp, "Flow_Label"] = df.loc[mask_rtp].apply(
+            lambda row: classify_rtp_flow(row["Type"], classify_ip(row["Source IP"])), axis=1
+        )
+
+    mask_tcp = (df["Type"] == "Upstream TCP") | (df["Type"] == "Downstream TCP")
+    if mask_tcp.any():
+        df.loc[mask_tcp, "Flow_Label"] = df.loc[mask_tcp].apply(
+            lambda row: classify_tcp_flow(
+                row["Type"],
+                classify_ip(row["Source IP"]),
+                row["Source Port"],
+                classify_ip(row["Destination IP"]),
+                row["Destination Port"]
+            ), axis=1
+        )
+
+    mask_udp = (df["Type"] == "Upstream UDP") | (df["Type"] == "Downstream UDP")
+    if mask_udp.any():
+        df.loc[mask_udp, "Flow_Label"] = df.loc[mask_udp].apply(
+            lambda row: classify_udp_flow(
+                row["Type"],
+                classify_ip(row["Source IP"]),
+                row["Source Port"],
+                classify_ip(row["Destination IP"]),
+                row["Destination Port"]
+            ), axis=1
+        )
+
+    mask_stun = df["Type"] == "STUN"
+    if mask_stun.any():
+        df.loc[mask_stun, "Flow_Label"] = (
+            "STUN | " + df.loc[mask_stun, "Source IP"].apply(classify_ip)
+        )
+
+    df = df[df["Flow_Label"] != ""]
+
+    flows = df["Flow_Label"].unique()[::-1]
+
+    _, ax = plt.subplots(figsize=(14, 8))
+
+    y_positions = {flow: i for i, flow in enumerate(flows)}
+
+    for flow in df["Type"].unique():
+        if flow not in flow_mapping:
+            continue
+        flow_data = df[df["Type"] == flow]
+        for flow_label, flow_group in flow_data.groupby("Flow_Label"):
+            category = flow_mapping.get(flow, "Unknown")
+            color = color_mapping.get(category, "gray")
+
+            start_times = flow_group["Relative Time"].values
+            y_pos = y_positions[flow_label]
+            ax.broken_barh(
+                [(t, 1) for t in start_times],
+                (y_pos, 0.8),
+                facecolors=color,
+                edgecolor="none",
+                linewidth=0.6,
+                alpha=0.7
+            )
+
+    ax.set_title("MS Teams Protocol Flow Sequence Analysis", fontsize=14, pad=20)
+
+    ax.set_xlabel("Timestamp (seconds)", fontsize=12, labelpad=10)
+    ax.set_yticks([y_positions[flow] + 0.4 for flow in flows])
+    ax.set_yticklabels(flows, fontsize=10)
+    ax.grid(True, linestyle="--", linewidth=0.5, color="gray", alpha=0.5)
+
+    handles = [
+        mpatches.Patch(color=color_mapping[key], label=key)
+        for key in color_mapping
+    ]
+    ax.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.1),  
+        ncol=len(color_mapping),      
+        fontsize=10,
+        title="Flow Types",
+        title_fontsize=10,
+        frameon=False,
+        handletextpad=0.5,  
+        columnspacing=1.0,  
+        borderaxespad=0.0   
+    )
+
+    plt.tight_layout(pad=2)
+    plt.savefig(args.output or "call_flow_diagram.png")
+
+def plot_call_flow_session_setup(df, time_window=15):
+    """
+    Plots a call flow diagram showing the sequence of different flow types, zoomed in to a
+    time range within ±`time_window` seconds of session setup events.
+    """
+    def filter_for_session_setup(df, time_window):
+        setup_timestamps = df.loc[df["Session Setup Type"] == "Initial Setup", "Timestamp"]
+        # Create a filter mask for timestamps within the time window of any setup event
+        mask = df["Timestamp"].apply(
+            lambda t: any(abs((t - setup).total_seconds()) <= time_window for setup in setup_timestamps)
+        )
+        return df[mask]
+
+    # df = df[df["Source IP"] != "172.30.0.1"]
+    # df = df[df["Source IP"] != "10.0.0.138"]
+    # df["Source IP"] = df["Source IP"].replace("172.30.12.151", "10.0.0.50 (User A)")
+    # df["Source IP"] = df["Source IP"].replace("120.17.48.40", "198.51.100.1 (User A)")
+    # df["Source IP"] = df["Source IP"].replace("10.0.0.189", "10.0.0.100 (User B)")
+
+    df_zoomed = filter_for_session_setup(df, time_window)
+    if df_zoomed.empty:
+        print("No data within the specified time window.")
+        return
+
+    flow_mapping = {
+        "DNS": "DNS",
+        "RTP Audio": "RTP Audio",
+        "RTP Video": "RTP Video",
+        "RTP ScreenShare": "RTP ScreenShare",
+        "RTCP": "RTCP",
+        "Upstream TCP": "TCP",
+        "Upstream UDP": "UDP",
+        "Downstream TCP": "TCP",
+        "Downstream UDP": "UDP",
+        "STUN": "STUN"
+    }
+
+    color_mapping = {
+        "DNS": "blue",
+        "RTP Audio": "green",
+        "RTP Video": "orange",
+        "RTP ScreenShare": "purple",
+        "RTCP": "lightgreen",
+        "STUN": "lightgray",
+        "TCP": "red",
+        "UDP": "cyan"
+    }
+
+    df_zoomed = df_zoomed.copy()
+    df_zoomed["Flow_Label"] = ""
+
+    mask_dns = df_zoomed["Type"] == "DNS"
+    if mask_dns.any():
+        df_zoomed.loc[mask_dns, "Flow_Label"] = df_zoomed.loc[mask_dns].apply(
+            lambda row: classify_dns_query(row["Query"], classify_ip(row["Source IP"])), axis=1
+        )
+
+    mask_rtp = df_zoomed["Type"].str.contains("RTP", na=False)
+    if mask_rtp.any():
+        df_zoomed.loc[mask_rtp, "Flow_Label"] = df_zoomed.loc[mask_rtp].apply(
+            lambda row: classify_rtp_flow(row["Type"], classify_ip(row["Source IP"])), axis=1
+        )
+
+    mask_tcp = (df_zoomed["Type"] == "Upstream TCP") | (df_zoomed["Type"] == "Downstream TCP")
+    if mask_tcp.any():
+        df_zoomed.loc[mask_tcp, "Flow_Label"] = df_zoomed.loc[mask_tcp].apply(
+            lambda row: classify_tcp_flow(
+                row["Type"],
+                classify_ip(row["Source IP"]),
+                row["Source Port"],
+                classify_ip(row["Destination IP"]),
+                row["Destination Port"]
+            ), axis=1
+        )
+
+    mask_udp = (df_zoomed["Type"] == "Upstream UDP") | (df_zoomed["Type"] == "Downstream UDP")
+    if mask_udp.any():
+        df_zoomed.loc[mask_udp, "Flow_Label"] = df_zoomed.loc[mask_udp].apply(
+            lambda row: classify_udp_flow(
+                row["Type"],
+                classify_ip(row["Source IP"]),
+                row["Source Port"],
+                classify_ip(row["Destination IP"]),
+                row["Destination Port"]
+            ), axis=1
+        )
+
+    mask_stun = df_zoomed["Type"] == "STUN"
+    if mask_stun.any():
+        df_zoomed.loc[mask_stun, "Flow_Label"] = (
+            "STUN | " + df_zoomed.loc[mask_stun, "Source IP"].apply(classify_ip)
+        )
+
+    df_zoomed = df_zoomed[df_zoomed["Flow_Label"] != ""]
+    flows = df_zoomed["Flow_Label"].unique()[::-1]
+
+    _, ax = plt.subplots(figsize=(14, 8))
+
+    y_positions = {flow: i for i, flow in enumerate(flows)}
+
+    for flow in df_zoomed["Type"].unique():
+        if flow not in flow_mapping:
+            continue
+        flow_data = df_zoomed[df_zoomed["Type"] == flow]
+        for flow_label, flow_group in flow_data.groupby("Flow_Label"):
+            category = flow_mapping.get(flow, "Unknown")
+            color = color_mapping.get(category, "gray")
+
+            start_times = flow_group["Relative Time"].values
+            y_pos = y_positions[flow_label]
+            ax.broken_barh(
+                [(t, 1) for t in start_times],
+                (y_pos, 0.8),
+                facecolors=color,
+                edgecolor="black",
+                linewidth=0.6,
+                alpha=0.7
+            )
+
+    ax.set_title("MS Teams Protocol Flow Sequence Analysis", fontsize=14, pad=20)
+
+    ax.set_xlabel("Timestamp (seconds)", fontsize=12, labelpad=10)
+    ax.set_yticks([y_positions[flow] + 0.4 for flow in flows])
+    ax.set_yticklabels(flows, fontsize=10)
+    ax.grid(True, linestyle="--", linewidth=0.5, color="gray", alpha=0.5)
+
+    handles = [
+        mpatches.Patch(color=color_mapping[key], label=key)
+        for key in color_mapping
+    ]
+    ax.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.1), 
+        ncol=len(color_mapping),      
+        fontsize=10,
+        title="Flow Types",
+        title_fontsize=10,
+        frameon=False,
+        handletextpad=0.5,  
+        columnspacing=1.0,  
+        borderaxespad=0.0   
+    )
+
+    plt.tight_layout(pad=2)
+    plt.savefig(args.output or "session_setup_call_flow_diagram.png")
+
+def plot_media_type_distribution(df):
+    """
+    Plots the distribution of different media types (Audio, Video, ScreenShare) in a refined bar chart.
+    """
+    df = df.dropna(subset=["Media Type"])
+    media_counts = df["Media Type"].value_counts()
+    
+    plt.figure(figsize=(10, 6))
+    
+    ax = media_counts.plot(
+        kind="bar", 
+        color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"], 
+        alpha=0.85,
+        edgecolor='black'
+    )
+    
+    plt.title("Distribution of Media Sessions by Media Type in MS Teams", fontsize=18, weight='bold')
+    plt.xlabel("Media Type", fontsize=14)
+    plt.ylabel("Number of Packets", fontsize=14)
+    
+    ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+    ax.yaxis.get_offset_text().set_fontsize(12)
+    ax.yaxis.get_offset_text().set_position((-0.08, 0))
+    
+    for i, value in enumerate(media_counts):
+        ax.text(i, value + value * 0.01, f"{value:.1e}", ha="center", va="bottom", fontsize=12, color="black", weight='bold')
+    
+    plt.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.6, color="#B3B3B3")
+    plt.tight_layout()
+    plt.savefig("media_type_distribution.png")
+    plt.close()
+
+    return generate_media_distribution_summary(df, media_counts)
+
+def plot_setup_time_over_day(df, window=10):
+    """
+    Plots how session setup times vary throughout the day with a rolling average line.
+    Only considers the hour, minute, and second of each timestamp for daily patterns.
+    Adds a quantitative metrics summary.
+    """
+
+    df = df[df["Session Setup Type"] == "Initial Setup"]
+    df = df.dropna(subset=["Session Setup Time"])
+
+    df = df.sort_values(by="Timestamp")
+
+    df["Rolling Avg Setup Time"] = df["Session Setup Time"].rolling(window=window, min_periods=1).mean()
+
+    plt.figure(figsize=(16, 9))
+
+    sns.scatterplot(
+        x=df["Timestamp"], 
+        y=df["Session Setup Time"], 
+        color="#A6CEE3", 
+        label="Session Setup Time", 
+        alpha=0.6, 
+        s=20
+    )
+
+    plt.plot(
+        df["Timestamp"], 
+        df["Rolling Avg Setup Time"], 
+        color="#1F78B4", 
+        label=f"{window}-Minute Rolling Average", 
+        linewidth=2.5
+    )
+
+    plt.title("Daily Variation in MS Teams Session Setup Times", fontsize=18, weight='bold')
+    plt.xlabel("Time of Day", fontsize=14)
+    plt.ylabel("Session Setup Time (s)", fontsize=14)
+    
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+    ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(rotation=45, ha="right", fontsize=12)
+    plt.yticks(fontsize=12)
+    
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5, color="#B3B3B3", alpha=0.7)
+    
+    mean_setup_time = df["Session Setup Time"].mean()
+    median_setup_time = df["Session Setup Time"].median()
+    
+    plt.axhline(mean_setup_time, color="#33A02C", linestyle="--", linewidth=1.5, label=f"Mean Setup Time: {mean_setup_time:.2f}s")
+    plt.axhline(median_setup_time, color="#FB9A99", linestyle=":", linewidth=1.5, label=f"Median Setup Time: {median_setup_time:.2f}s")
+    
+    plt.legend(title="Metrics", loc="upper right", fontsize=12)
+    plt.tight_layout()
+
+    plt.savefig(args.output or "setup_time_over_day.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+    return generate_setup_time_over_day_summary(df)
+
+def plot_session_count(df):
+    """
+    Plots the number of sessions initiated in each hour
+    during working hours, filtered by specific dates of interest.
+    """
+    df = df[(df["Session Setup Time"].notnull()) & (df["Session Setup Type"] == "Initial Setup")].copy()
+    if df.empty:
+        print("No data found.")
+        return
+
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    start_time = "08:00:00"
+    end_time = "18:00:00"
+
+    df_filtered = pd.DataFrame()
+    for date in dates_of_interest:
+        date_filtered = df[(df["Timestamp"].dt.date == pd.to_datetime(date).date()) &
+                           (df["Timestamp"].dt.time >= pd.to_datetime(start_time).time()) &
+                           (df["Timestamp"].dt.time <= pd.to_datetime(end_time).time())].copy()
+        
+        # Set a fixed date for 'Time of Day' to align x-axis across multiple days
+        date_filtered["Time of Day"] = date_filtered["Timestamp"].apply(lambda x: x.replace(year=2024, month=9, day=10))
+        df_filtered = pd.concat([df_filtered, date_filtered])
+
+    df_filtered["Time Bin"] = df_filtered["Time of Day"].dt.floor("H")
+    session_counts = df_filtered.groupby("Time Bin").size()
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    ax.bar(session_counts.index, session_counts.values, color="skyblue", alpha=0.8, width=0.03)
+
+    ax.set_title("Number of Sessions Initiated Each Hour", fontsize=10)
+    ax.set_xlabel("Time of Day", fontsize=8)
+    ax.set_ylabel("Number of Sessions", fontsize=8)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(fontsize=7, rotation=45, ha="right")
+    plt.yticks(fontsize=7)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig("session_count_per_hour.png")
+    plt.close()
+
+
+def plot_session_stage_durations(df):
+    """
+    Plots a stacked bar chart showing the time spent in each session stage 
+    (Initiation, Progress, Established) for initial setup sessions.
+    """
+    columns_needed = ["Source IP", "Type", "State", "Timestamp", "Session Setup Type"]
+    missing_columns = [col for col in columns_needed if col not in df.columns]
+    if missing_columns:
+        print(f"Missing columns: {', '.join(missing_columns)}")
+        return
+    session_df = df[df["Type"] == "Session Setup"][columns_needed].sort_values(by=["Source IP", "Timestamp"])
+    sessions = []
+    session_data = {}
+    
+    for index, row in session_df.iterrows():
+        source_ip = row["Source IP"]
+        stage = row["State"]
+        timestamp = row["Timestamp"]
+        setup_type = row.get("Session Setup Type", None)
+
+        if stage == "Initiation":
+            session_data = {
+                "Source IP": source_ip,
+                "Initiation Time": timestamp,
+                "Progress Time": None,
+                "Setup Type": setup_type
+            }
+        elif stage == "Connecting" and session_data.get("Initiation Time") is not None:
+            session_data["Progress Time"] = timestamp
+        elif stage == "Established" and session_data.get("Progress Time") is not None:
+            if setup_type == "Initial Setup":
+                initiation_duration = (session_data["Progress Time"] - session_data["Initiation Time"]).total_seconds()
+                progress_duration = (timestamp - session_data["Progress Time"]).total_seconds()
+
+                sessions.append({
+                    "Session ID": f"{len(sessions) + 1}",
+                    "Initiation Duration": initiation_duration,
+                    "Progress Duration": progress_duration
+                })
+
+            session_data = {}
+
+    stage_df = pd.DataFrame(sessions)
+    if len(stage_df) == 0:
+        print("No data found")
+        return
+
+    plt.figure(figsize=(14, 8))
+    stage_df.set_index("Session ID")[["Initiation Duration", "Progress Duration"]].plot(
+        kind="bar", stacked=True, color=["#A6CEE3", "#1F78B4", "#B2DF8A"], edgecolor="black", alpha=0.8)
+
+    plt.title("Session Setup Stage Durations during Call Setup", fontsize=18, weight="bold")
+    plt.xlabel("Session ID", fontsize=14)
+    plt.ylabel("Duration (s)", fontsize=14)
+    plt.legend(title="Stages", labels=["Initiation", "Progress"], loc="upper right", fontsize=12)
+
+    plt.xticks(rotation=45, ha="right", fontsize=10)
+    plt.yticks(fontsize=12)
+    plt.grid(axis="y", linestyle="--", linewidth=0.5, color="#B3B3B3", alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig("session_stage_durations.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return stage_df
+
+def plot_abandonment_rate(df):
+    """
+    Visualizes the proportion of calls that are abandoned.
+    """
+    abandonment_rate = calculate_call_abandonment_rate(df)
+    plt.figure(figsize=(6, 6))
+    labels = ["Completed", "Abandoned"]
+    sizes = [100 - abandonment_rate, abandonment_rate]
+    colors = ["green", "red"]
+
+    plt.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140, colors=colors)
+    plt.title("Call Abandonment Rate")
+    plt.tight_layout()
+    plt.savefig(args.output or "abandonment_rate.png")
+    plt.close()
+
+def plot_media_flow_distribution(df):
+    """
+    Plots a pie chart of the distribution of audio, video, and screenshare flows.
+    """
+    rtp_packets = df[(df["Type"].str.startswith("RTP")) & (~df["Source IP"].apply(is_ip_in_teams_ranges))]
+    if rtp_packets.empty:
+        print("No data found")
+        return
+    
+    rtp_packets = rtp_packets.dropna(subset=["Media Type"])
+    media_counts = rtp_packets["Media Type"].value_counts()
+    plt.figure(figsize=(6, 6))
+    media_counts.plot(kind="pie", autopct="%1.1f%%", startangle=90, colors=["#6BAED6", "#74C476", "#FD8D3C", "#9E9AC8", "#E7BA52"])
+    plt.title("Media Flow Distribution")
+    plt.ylabel("")
+    plt.tight_layout()
+    plt.savefig(args.output or "media_flow_distribution.png")
+    plt.close()
+
+    return generate_media_distribution_summary(df, media_counts)
+
+def plot_media_types_in_calls(df):
+    columns_needed = ["Source IP", "Destination IP", "Type", "State", "Timestamp", "Session Setup Type", "SSRC", "Media Type"]
+    missing_columns = [col for col in columns_needed if col not in df.columns]
+    if missing_columns:
+        print(f"Missing columns: {', '.join(missing_columns)}")
+        return
+    
+    df = df[(df["Type"].str.startswith("RTP")) | (df["Type"] == "Session Setup")][columns_needed].sort_values(by=["Source IP", "Timestamp"])
+    if df.empty:
+        print("No data found")
+        return
+
+    call_summaries = []
+    used_ssrcs = set()
+
+    for source_ip, group in df.groupby('Source IP'):
+        current_call = None
+
+        for _, session in group.iterrows():
+            if session['Session Setup Type'] == "Initial Setup" and session['State'] == "Established":
+                if current_call is not None:
+                    call_summaries.append(current_call)
+
+                matching_rtp_flows = df[(df['Type'].str.startswith("RTP")) & 
+                                           (df['Timestamp'] >= session['Timestamp']) &
+                                            ((df['Source IP'] == source_ip) | (df['Destination IP'] == source_ip)) &
+                                           (~df['SSRC'].isin(used_ssrcs))]
+
+                first_rtp_flow = matching_rtp_flows.iloc[0]
+                used_ssrcs.add(first_rtp_flow['SSRC'])
+
+                current_call = {
+                    "Source IP": source_ip,
+                    "Start Time": session['Timestamp'],
+                    "Media Types": {first_rtp_flow['Media Type']}
+                }
+
+            elif session['Session Setup Type'] == "Subsequent Media" and session['State'] == "Established":
+                matching_rtp_flows = df[(df['Type'].str.startswith("RTP")) & 
+                                           (df['Timestamp'] >= session['Timestamp']) &
+                                            ((df['Source IP'] == source_ip) | (df['Destination IP'] == source_ip)) &
+                                           (~df['SSRC'].isin(used_ssrcs))]
+
+                if not matching_rtp_flows.empty:
+                    first_rtp_flow = matching_rtp_flows.iloc[0]
+                    used_ssrcs.add(first_rtp_flow['SSRC'])
+                    current_call['Media Types'].add(first_rtp_flow['Media Type'])
+
+    if current_call is not None:
+        call_summaries.append(current_call)
+
+    if not call_summaries:
+        print("No calls detected")
+        return
+
+    summary_df = pd.DataFrame(call_summaries)
+
+    observed_combinations = summary_df['Media Types'].apply(lambda x: frozenset([str(item) for item in x if isinstance(item, str)])).value_counts()
+    sorted_combinations = sorted(observed_combinations.items(), key=lambda x: len(x[0]))
+
+    combination_labels = [' & '.join(combo) for combo, _ in sorted_combinations]
+    combination_values = [count for _, count in sorted_combinations]
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(combination_labels, combination_values, color='#6BAED6', alpha=0.7)
+    plt.title("Distribution of Observed Media Types in Calls")
+    plt.xlabel("Media Type Combinations")
+    plt.ylabel("Number of Calls")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig("media_type_combinations_in_calls.png")
+    plt.close()
+
+    return generate_media_type_metrics_summary(summary_df)
+
+def plot_rtp_jitter(df):
+    """
+    Plots RTP jitter by media type during working hours over multiple dates.
+    Uses 15-minute aggregated time bins and soft colors, with y-axis starting from zero.
+    """
+    df = df[(df["Type"].str.startswith("RTP")) & (df["Jitter (ms)"].notnull()) & (df["Jitter (ms)"] >= 0) & (df["Jitter (ms)"] < 80)]
+    if (len(df) == 0):
+        print("No data found")
+        return
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+
+    media_types = ["Audio", "Video", "ScreenShare"]
+    colors = {"Audio": "lightblue", "Video": "lightgreen", "ScreenShare": "peachpuff"}
+
+    start_time = pd.to_datetime("08:00:00").time()
+    end_time = pd.to_datetime("18:00:00").time()
+
+    fig, axes = plt.subplots(len(media_types), 1, figsize=(6, 6), sharex=True)
+    fig.suptitle("RTP Jitter by Media Type", fontsize=10)
+
+    for i, media_type in enumerate(media_types):
+        ax = axes[i]
+
+        media_filtered = df[df["Media Type"].str.contains(media_type, case=False, na=False)].copy()
+
+        media_filtered["Time of Day"] = media_filtered["Timestamp"].apply(lambda x: x.replace(year=1970, month=1, day=1))
+
+        media_filtered["Time Bin"] = media_filtered["Time of Day"].dt.floor("1s")
+        binned_data = media_filtered.groupby("Time Bin")["Jitter (ms)"].mean().reset_index()
+
+        if (len(media_filtered) == 0):
+            continue
+
+        ax.plot(binned_data["Time Bin"], binned_data["Jitter (ms)"], color=colors[media_type], linewidth=1.5, alpha=0.7)
+        ax.fill_between(binned_data["Time Bin"], 0, binned_data["Jitter (ms)"], color=colors[media_type], alpha=0.3)
+
+        ax.set_ylabel("Jitter (ms)", fontsize=8)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        
+        ax.text(0.02, 0.85, media_type, transform=ax.transAxes, fontsize=10, weight="bold", color=colors[media_type])
+
+    plt.xlabel("Time of Day", fontsize=8)
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.yticks(fontsize=7)
+    plt.xticks(fontsize=7, rotation=45, ha="right")
+
+    plt.xlim(pd.Timestamp(f"1970-01-01 {start_time}"), pd.Timestamp(f"1970-01-01 {end_time}"))
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])  
+    plt.savefig("rtp_jitter_by_media_type.png")
+    plt.close()
+
+    mean_jitter_per_channel = df.groupby(
+        ["Source IP", "Destination IP", "SSRC", "Media Type"]
+    )["Jitter (ms)"].mean().reset_index()
+
+    mean_jitter_per_channel.rename(
+        columns={"Jitter (ms)": "Mean Jitter (ms)"}, inplace=True
+    )
+
+    mean_jitter_per_channel.to_excel("mean_jitter_per_channel.xlsx", index=False)
+
+    return generate_jitter_metrics_summary(df)
+
+def plot_latency(df):
+    """
+    Plots one-way latency during working hours over multiple dates.
+    Uses aggregated time bins and includes a moving average line for better readability.
+    """
+    df = df[(df["Type"].str.endswith(" TCP")) & 
+            (df["Latency"].notnull()) & 
+            (df["Latency"] > 0) & 
+            (df["Latency"] < 500) & 
+            (df["Source IP"].apply(is_ip_in_teams_ranges))]
+    
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    colors = {"2024-09-09": "dodgerblue", "2024-09-19": "green", "2024-09-20": "orange"}
+
+    start_time = "08:00:00"
+    end_time = "18:00:00"
+
+    df_filtered = pd.DataFrame()
+    for date in dates_of_interest:
+        date_filtered = df[(df["Timestamp"].dt.date == pd.to_datetime(date).date()) &
+                           (df["Timestamp"].dt.time >= pd.to_datetime(start_time).time()) &
+                           (df["Timestamp"].dt.time <= pd.to_datetime(end_time).time())].copy()
+        
+        date_filtered["Time of Day"] = date_filtered["Timestamp"].apply(lambda x: x.replace(year=2024, month=9, day=10))
+        date_filtered["Date"] = date
+        df_filtered = pd.concat([df_filtered, date_filtered])
+
+    df_filtered['Time Bin'] = df_filtered['Time of Day'].dt.floor('15min')
+    binned_data = df_filtered.groupby(['Date', 'Time Bin'])['Latency'].mean().reset_index()
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+
+    for date in dates_of_interest:
+        scatter_data = df_filtered[df_filtered["Date"] == date]
+        ax.scatter(
+            scatter_data["Time of Day"], scatter_data["Latency"], 
+            color=colors[date], s=6, alpha=0.3, marker='o'
+        )
+
+    moving_average = binned_data.groupby('Time Bin')['Latency'].mean()
+    ax.plot(moving_average.index, moving_average, label='Moving Avg (15 min)', color='black', linestyle='--', linewidth=1.5)
+
+    ax.legend(loc="upper right", fontsize=7)
+
+    ax.set_title("Temporal Variation in Latency (TCP Round-Trip Time)", fontsize=10)
+    ax.set_xlabel("Time of Day", fontsize=8)
+    ax.set_ylabel("Latency (ms)", fontsize=8)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(fontsize=7, rotation=45, ha="right")
+    plt.yticks(fontsize=7)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig("tcp_latency_over_time.png")
+    plt.close()
+
+    return generate_latency_metrics_summary(df_filtered)
+
+def calculate_rtp_latency(df):
+    """
+    Calculates RTT latency by identifying pairs of RTP packets with the same sequence number
+    and media type, going from Source IP (A) to Destination IP (B) and then returning from 
+    Destination IP (B) back to Source IP (A).
+    """
+    # Step 1: Filter rows with non-null values in essential columns
+    df_rtp = df.dropna(subset=["Sequence Number", "Timestamp", "Source IP", "Destination IP", "Media Type"])
+    print(f"Total RTP packets after dropping NaNs: {len(df_rtp)}")
+
+    packets_a_to_b = df_rtp.copy()
+    packets_b_to_a = df_rtp.copy()
+
+    packets_a_to_b = packets_a_to_b.rename(columns={"Source IP": "Source IP_A", "Destination IP": "Destination IP_B", "Timestamp": "Timestamp_A_to_B"})
+    packets_b_to_a = packets_b_to_a.rename(columns={"Source IP": "Destination IP_B", "Destination IP": "Source IP_A", "Timestamp": "Timestamp_B_to_A"})
+
+    a_to_b_dict = packets_a_to_b.set_index(["Sequence Number", "Media Type", "Source IP_A", "Destination IP_B"]).to_dict("index")
+    b_to_a_dict = packets_b_to_a.set_index(["Sequence Number", "Media Type", "Source IP_A", "Destination IP_B"]).to_dict("index")
+
+    results = []
+
+    for key, a_to_b_data in a_to_b_dict.items():
+        if key in b_to_a_dict:
+            b_to_a_data = b_to_a_dict[key]
+            
+            rtt_ms = (b_to_a_data["Timestamp_B_to_A"] - a_to_b_data["Timestamp_A_to_B"]).total_seconds() * 1000
+            
+            if rtt_ms > 0:
+                results.append({
+                    "Sequence Number": key[0],
+                    "Media Type": key[1],
+                    "Source IP A": key[2],
+                    "Destination IP B": key[3],
+                    "RTT (ms)": rtt_ms,
+                    "Timestamp A to B": a_to_b_data["Timestamp_A_to_B"],
+                    "Timestamp B to A": b_to_a_data["Timestamp_B_to_A"]
+                })
+
+    results_df = pd.DataFrame(results)
+    print(f"Total matched pairs with positive RTT: {len(results_df)}")
+
+    print("\nSample of matched data with calculated RTT:")
+    print(results_df.head())
+
+    return results_df
+
+def plot_rtp_latency(df):
+    """
+    Plots RTP RTT latency by media type during working hours over multiple dates.
+    Uses hourly time bins and includes latency as a scatter plot for better readability.
+    """
+    df_rtp = df[(df["Type"].str.startswith("RTP")) & (df["Sequence Number"].notnull())]
+    if df_rtp.empty:
+        print("No data found.")
+        return
+
+    df_rtp_latency = calculate_rtp_latency(df_rtp)
+    
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    media_types = ["Audio", "Video", "ScreenShare"]
+    colors = {"Audio": "dodgerblue", "Video": "green", "ScreenShare": "orange"}
+    start_time = "08:00:00"
+    end_time = "18:00:00"
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    for media_type in media_types:
+        for date in dates_of_interest:
+            date_filtered = df_rtp_latency[
+                (df_rtp_latency["Timestamp_A_to_B"].dt.date == pd.to_datetime(date).date()) &
+                (df_rtp_latency["Timestamp_A_to_B"].dt.time >= pd.to_datetime(start_time).time()) &
+                (df_rtp_latency["Timestamp_A_to_B"].dt.time <= pd.to_datetime(end_time).time()) &
+                (df_rtp_latency["Media Type"].str.contains(media_type, case=False, na=False))
+            ].copy()
+
+            date_filtered["Time of Day"] = date_filtered["Timestamp_A_to_B"].apply(lambda x: x.replace(year=1970, month=1, day=1))
+
+            if not date_filtered.empty:
+                ax.scatter(
+                    date_filtered["Time of Day"], date_filtered["RTT (ms)"],
+                    label=media_type if date == dates_of_interest[0] else "",
+                    color=colors[media_type], s=8, alpha=0.3, marker='o'
+                )
+
+    ax.set_title("RTP RTT Latency by Media Type during Working Hours over a 3-day Period", fontsize=16)
+    ax.set_xlabel("Time of Day", fontsize=12)
+    ax.set_ylabel("RTT Latency (ms)", fontsize=12)
+
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(rotation=45, ha="right")
+
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.legend(title="Media Type", loc="upper right", fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig("rtp_rtt_latency_by_media_type.png")
+    plt.close()
+
+def plot_tcp_retransmissions(df):
+    """
+    Plots TCP retransmission rate over time with a single moving average line for clarity,
+    using a softer color palette to match other graphs.
+    """
+    tcp_packets = df[(df["Type"].str.endswith(" TCP")) & (df["Retransmission Count"] > 0) & (~df["Source IP"].apply(is_ip_in_teams_ranges))]
+    if tcp_packets.empty:
+        print("No data found")
+        return
+
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    colors = {"2024-09-09": "dodgerblue", "2024-09-19": "green", "2024-09-20": "orange"}
+
+    start_time = "08:00:00"
+    end_time = "18:00:00"
+
+    df_filtered = pd.DataFrame()
+    for date in dates_of_interest:
+        date_filtered = tcp_packets[(tcp_packets["Timestamp"].dt.date == pd.to_datetime(date).date()) &
+                                    (tcp_packets["Timestamp"].dt.time >= pd.to_datetime(start_time).time()) &
+                                    (tcp_packets["Timestamp"].dt.time <= pd.to_datetime(end_time).time())].copy()
+        
+        date_filtered["Time of Day"] = date_filtered["Timestamp"].apply(lambda x: x.replace(year=2024, month=9, day=10))
+        date_filtered["Date"] = date
+        df_filtered = pd.concat([df_filtered, date_filtered])
+
+    df_filtered['Time Bin'] = df_filtered['Time of Day'].dt.floor('15min')
+    binned_data = df_filtered.groupby('Time Bin')['Retransmission Rate'].mean().reset_index()
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+
+    ax.plot(binned_data["Time Bin"], binned_data["Retransmission Rate"], label='Moving Avg (15 min)', 
+            color='black', linestyle='--', linewidth=1.5)
+
+    ax.legend(loc="upper right", fontsize=10)
+
+    ax.set_title("TCP Retransmission Rate", fontsize=10)
+    ax.set_xlabel("Time of Day", fontsize=8)
+    ax.set_ylabel("Retransmission Rate (%)", fontsize=8)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(fontsize=7, rotation=45, ha="right")
+    plt.yticks(fontsize=7)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig("tcp_retransmission_rate_over_time.png")
+    plt.close()
+
+    return generate_retransmission_metrics_summary(df_filtered)
+
+def plot_ice_renegotiations(df):
+    """
+    Plots ICE renegotiation attempts for initial session setups with a moving average.
+    Only plots intervals where renegotiation attempts are greater than zero.
+    """
+    # Filter for session establishments and ensure relevant data exists
+    session_data = df[(df['Type'] == 'Session Setup') & 
+                      (df['State'] == 'Established') & 
+                      (df["Renegotiation Attempts"].notnull()) & 
+                      (df["Renegotiation Attempts"] > 0) & 
+                      (df["Renegotiation Attempts"] < 20) &
+                      (df['Session Setup Type'] == 'Initial Setup')].copy()
+    if session_data.empty:
+        print("No data found")
+        return
+
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    colors = {"2024-09-09": "dodgerblue", "2024-09-19": "green", "2024-09-20": "orange"}
+
+    df_filtered = pd.DataFrame()
+    start_time = "08:00:00"
+    end_time = "18:00:00"
+
+    for date in dates_of_interest:
+        date_filtered = session_data[(session_data["Timestamp"].dt.date == pd.to_datetime(date).date()) &
+                           (session_data["Timestamp"].dt.time >= pd.to_datetime(start_time).time()) &
+                           (session_data["Timestamp"].dt.time <= pd.to_datetime(end_time).time())].copy()
+        
+        date_filtered["Time of Day"] = date_filtered["Timestamp"].apply(lambda x: x.replace(year=2024, month=9, day=10))
+        date_filtered["Date"] = date
+        df_filtered = pd.concat([df_filtered, date_filtered])
+
+    df_filtered['Time Bin'] = df_filtered['Time of Day'].dt.floor('15min')
+    binned_data = df_filtered.groupby(['Date', 'Time Bin'])['Renegotiation Attempts'].mean().reset_index()
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+
+    for date in dates_of_interest:
+        scatter_data = df_filtered[df_filtered["Date"] == date]
+        ax.scatter(
+            scatter_data["Time of Day"], scatter_data["Renegotiation Attempts"], 
+            color=colors[date], s=6, alpha=0.3
+        )
+
+    moving_average = binned_data.groupby('Time Bin')['Renegotiation Attempts'].mean()
+    ax.plot(moving_average.index, moving_average, label='Moving Avg (15 min)', color='black', linestyle='--', linewidth=1.5)
+    ax.legend(loc="upper right", fontsize=10)
+
+    ax.set_title("ICE Renegotiation Attempts per Teams Session", fontsize=10)
+    ax.set_xlabel("Time of Day", fontsize=8)
+    ax.set_ylabel("ICE Renegotiation Attempts", fontsize=8)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(fontsize=7, rotation=45, ha="right")
+    plt.yticks(fontsize=7)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig("ice_renegotiation_scatter.png")
+    plt.close()
+
+    return generate_renegotiation_attempts_summary(df_filtered)
+
+def plot_session_signalling_load(df):
+    """
+    Calculates total egress bytes per call setup (signaling load) for TCP and STUN traffic
+    by examining packets from session initiation until the session established packet is found.
+    Overlays session setup time as a bar graph for each session.
+    """
+    df = df[["Source IP", "Destination IP", "Payload Length", "Type", "Timestamp", "State", "Session Setup Time", "Session Setup Type"]]
+
+    active_sessions = {}
+    results = []
+    session_id = 1
+    DEBUG = False
+
+    for _, row in df.iterrows():
+        src_ip = row["Source IP"]
+        dst_ip = row["Destination IP"]
+        payload_length = row.get("Payload Length", None)
+        packet_type = row["Type"]
+
+        if row['Type'] == 'Session Setup':
+            if row['State'] == "Initiation":
+                active_sessions[src_ip] = {
+                    "TCP Bytes": 0,
+                    "STUN Bytes": 0,
+                    "Start Time": row["Timestamp"]
+                }
+                if DEBUG: print(','.join(map(str, row)))
+            elif row['State'] == "Established" and src_ip in active_sessions:
+                session_data = active_sessions[src_ip]
+                tcp_signaling_load = session_data["TCP Bytes"]
+                stun_signaling_load = session_data["STUN Bytes"]
+
+                if row["Session Setup Type"] == "Initial Setup":
+                    results.append({
+                        "Session ID": session_id,
+                        "TCP Signaling Load (Bytes)": tcp_signaling_load,
+                        "STUN Signaling Load (Bytes)": stun_signaling_load,
+                        "Session Setup Time (s)": row["Session Setup Time"]
+                    })
+                    session_id += 1
+                del active_sessions[src_ip]
+                if DEBUG: print(','.join(map(str, row)))
+            continue
+
+        if pd.isna(payload_length) or row['Type'].startswith('RTP') or row['Type'] == 'DNS':
+            continue
+
+        if src_ip in active_sessions:
+            if DEBUG: print(','.join(map(str, row)))
+            if packet_type.endswith("TCP"):
+                active_sessions[src_ip]["TCP Bytes"] += payload_length
+            elif packet_type == "STUN":
+                active_sessions[src_ip]["STUN Bytes"] += payload_length
+
+    # Convert results to DataFrame
+    signaling_load_df = pd.DataFrame(results)
+    if signaling_load_df.empty:
+        print("No data found")
+        return
+
+    # Create plot
+    fig, ax1 = plt.subplots(figsize=(14, 4))
+
+    ax1.plot(
+        signaling_load_df["Session ID"], signaling_load_df["TCP Signaling Load (Bytes)"],
+        label="TCP Signaling Load", linestyle='-', alpha=0.7, color="blue"
+    )
+    ax1.plot(
+        signaling_load_df["Session ID"], signaling_load_df["STUN Signaling Load (Bytes)"],
+        label="STUN Signaling Load", linestyle='-', alpha=0.7, color="orange"
+    )
+    ax1.set_ylabel("Signaling Load (Bytes)", fontsize=12)
+    ax1.set_xlabel("Session ID", fontsize=12)
+    ax1.grid(True, linestyle="--", alpha=0.6)
+    ax1.legend(title="Traffic Type", loc="upper right", fontsize=10)
+    ax1.tick_params(axis="both", which="major", labelsize=10)
+
+    ax2 = ax1.twinx()  # Create a second y-axis
+    ax2.bar(
+        signaling_load_df["Session ID"], signaling_load_df["Session Setup Time (s)"],
+        label="Session Setup Time", color="green", alpha=0.3, width=0.5
+    )
+    ax2.set_ylabel("Session Setup Time (s)", fontsize=12)
+    ax2.tick_params(axis="y", labelsize=10)
+
+    # Title and layout
+    plt.title("Signaling Load and Session Setup Time per Call Setup", fontsize=12)
+    fig.tight_layout()
+    plt.savefig("signaling_load_and_session_setup_time.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return signaling_load_df
+
+def plot_bandwidth(df):
+    def calculate_bandwidth(df):
+        columns_needed = ["Source IP", "Destination IP", "SSRC", "Media Type", "Payload Length", "Timestamp"]
+        df = df[(df["Type"].str.startswith("RTP")) & (~df["Source IP"].apply(is_ip_in_teams_ranges)) &
+                (df["Media Type"].isin(["Audio", "Video", "ScreenShare"]))][columns_needed].copy()
+
+        df["Payload Length"] = pd.to_numeric(df["Payload Length"], errors='coerce').fillna(0).astype(int)
+        
+        relevant_packets = df[df["Payload Length"] > 0].copy()
+        relevant_packets["Bandwidth Time Window"] = relevant_packets["Timestamp"].dt.floor("1s")
+
+        bandwidth_data = relevant_packets.groupby(
+            ["Source IP", "SSRC", "Media Type", "Bandwidth Time Window"]
+        )["Payload Length"].sum().reset_index()
+
+        bandwidth_data["Bandwidth"] = (bandwidth_data["Payload Length"] * 8) # convert to bits
+        bandwidth_data = bandwidth_data[
+            ~((bandwidth_data["Media Type"] == "Audio") & (bandwidth_data["Bandwidth"] > 80000))
+        ]
+        representative_packets = relevant_packets.drop_duplicates(
+            subset=["Source IP", "SSRC", "Bandwidth Time Window"], keep="first"
+        )
+
+        representative_packets = representative_packets.merge(
+            bandwidth_data[["Source IP", "SSRC", "Bandwidth Time Window", "Bandwidth"]],
+            on=["Source IP", "Bandwidth Time Window"],
+            how="left"
+        )
+
+        representative_packets = representative_packets[representative_packets["Bandwidth"].notnull()]
+        representative_packets = representative_packets.drop(columns=["Bandwidth Time Window"])
+
+        return representative_packets
+
+    bandwidth_data = calculate_bandwidth(df)
+    
+    if bandwidth_data.empty:
+        print("No data found")
+        return
+
+    bandwidth_data["Bandwidth (Mbps)"] = bandwidth_data["Bandwidth"] / 1e6
+
+    dates_of_interest = ["2024-09-09", "2024-09-19", "2024-09-20"]
+    media_types = ["Audio", "Video", "ScreenShare"]
+    colors = {"Audio": "dodgerblue", "Video": "green", "ScreenShare": "orange"}
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+
+    for media_type in media_types:
+        for date in dates_of_interest:
+            date_filtered = bandwidth_data[
+                (bandwidth_data["Timestamp"].dt.date == pd.to_datetime(date).date()) &
+                (bandwidth_data["Media Type"].str.contains(media_type, case=False, na=False))
+            ].copy()
+
+            date_filtered.loc[:, "Time of Day"] = date_filtered["Timestamp"].apply(lambda x: x.replace(year=1970, month=1, day=1))
+            
+            if not date_filtered.empty:
+                ax.scatter(
+                    date_filtered["Time of Day"], date_filtered["Bandwidth (Mbps)"], 
+                    label=media_type if date == dates_of_interest[0] else "", 
+                    color=colors[media_type], s=8, alpha=0.3, marker='o'
+                )
+
+    ax.set_title("Bandwidth Consumption by Media Type", fontsize=10)
+    ax.set_xlabel("Time of Day", fontsize=8)
+    ax.set_ylabel("Bandwidth (Mbps)", fontsize=8)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M %p"))
+    plt.xticks(fontsize=7, rotation=45, ha="right")
+    plt.yticks(fontsize=7)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.legend(title="Media Type", loc="upper right", fontsize=7, title_fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig("bandwidth_over_time.png")
+    plt.close()
+
+    return generate_bandwidth_metrics_summary(bandwidth_data)
+
+def plot_rtp_packet_loss_rate(df):
+    print("Calculating RTP packet loss rate...")
+    packet_loss_df = calculate_rtp_packet_loss(df)
+    print("No plot implementation defined.")
+
+def plot_combined_network_metrics(df):
+    df = df.copy()
+    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(14, 22), sharex=True)
+    
+    rtp_packets = df[(df["Type"].str.startswith("RTP")) & (df["Jitter (ms)"] > 0)]
+    jitter_summary = None
+    if not rtp_packets.empty:
+        sns.lineplot(x="Timestamp", y="Jitter (ms)", data=rtp_packets, hue="Source IP", ax=ax1, palette="tab10", alpha=0.6)
+        ax1.set_title("Jitter over Time (ms) for RTP Packets")
+        ax1.set_ylabel("Jitter (ms)")
+        ax1.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        jitter_summary = generate_jitter_metrics_summary(rtp_packets)
+        ax1.set_yscale("log")  
+
+    tcp_packets = df[(df["Type"].str.endswith(" TCP")) & (df["Latency"] > 0)]
+    latency_summary = None
+    if not tcp_packets.empty:
+        sns.lineplot(x="Timestamp", y="Latency", data=tcp_packets, hue="Source IP", ax=ax2, palette="tab10", alpha=0.6)
+        ax2.set_title("Latency over Time (ms) for TCP Packets")
+        ax2.set_ylabel("Latency (ms)")
+        ax2.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        latency_summary = generate_latency_metrics_summary(tcp_packets)
+
+    tcp_retransmissions = df[df["Retransmission Count"] > 0]
+    retransmission_summary = None
+    if not tcp_retransmissions.empty:
+        sns.lineplot(x="Timestamp", y="Retransmission Count", data=tcp_retransmissions, hue="Source IP", ax=ax3, palette="tab10", alpha=0.6)
+        ax3.set_title("TCP Retransmissions over Time")
+        ax3.set_ylabel("Retransmissions")
+        ax3.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        retransmission_summary = generate_retransmission_metrics_summary(tcp_retransmissions)
+
+    bandwidth_data = df[df["Bandwidth"] > 0]
+    bandwidth_summary = None
+    if not bandwidth_data.empty:
+        bandwidth_data.loc[:, "Bandwidth (Mbps)"] = bandwidth_data["Bandwidth"] / 1e6  # Convert to Mbps for readability
+        sns.lineplot(x="Timestamp", y="Bandwidth (Mbps)", data=bandwidth_data, hue="Source IP", ax=ax4, palette="tab10", alpha=0.6)
+        ax4.set_title("Bandwidth over Time (Mbps)")
+        ax4.set_ylabel("Bandwidth (Mbps)")
+        ax4.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+        bandwidth_summary = generate_bandwidth_metrics_summary(bandwidth_data)
+
+    ax5.set_xlabel("Timestamp")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    
+    plt.savefig(args.output or "combined_network_metrics.png")
+    plt.close()
+    
+    return {
+        "jitter_summary": jitter_summary,
+        "latency_summary": latency_summary,
+        "retransmission_summary": retransmission_summary,
+        "bandwidth_summary": bandwidth_summary
+    }
+
+## DATA PREPROCESSING
+
+def calculate_setup_times(df, time_threshold = 300):
+    if "Session Setup Time" not in df or df["Session Setup Time"].empty:
+        if len(df[(df["Type"].str.startswith("Session"))]) == 0:
+            return df
+        df["Session Setup Type"] = df.apply(lambda row: "Initial Setup" if row["State"] == "Initiation" else "Unknown", axis=1)
+        return df
+    
+    df["Session Setup Time"] = df["Session Setup Time"].apply(convert_time_to_seconds)
+    df = df.sort_values(["Source IP", "Timestamp"])
+    valid_sessions = df.dropna(subset=["Session Setup Time"]).copy()
+    valid_sessions["Time Since Last"] = valid_sessions.groupby("Source IP")["Timestamp"].diff().dt.total_seconds().fillna(0)
+    valid_sessions["Session Setup Type"] = "Subsequent Media"
+    valid_sessions.loc[(valid_sessions["Time Since Last"] > time_threshold) | (valid_sessions["Time Since Last"] == 0) | (valid_sessions["Session Setup Time"] > 0.1), "Session Setup Type"] = "Initial Setup"
+
+    df = df.merge(valid_sessions[["Source IP", "Timestamp", "Session Setup Type"]], on=["Source IP", "Timestamp"], how="left")
+    df["Session Setup Type"] = df["Session Setup Type"].fillna("Unknown")
+
+    return df
+
+def calculate_rtp_jitter(df):
+    if not INTERACTIVE_MODE and "rtp_jitter" not in args.plot and "high_session" not in args.plot and "combined_network_metrics" not in args.plot:
+        return df
+    
+    video_screenshare_types = ["Video", "ScreenShare"]
+    video_screenshare_mask = df["Media Type"].isin(video_screenshare_types) & (df["Marker"] == True)
+
+    # apply frame-level jitter for video and screenshare
+    if "Frame Jitter (ms)" in df:
+        df.loc[video_screenshare_mask, "Jitter (ms)"] = df.loc[video_screenshare_mask, "Frame Jitter (ms)"].apply(convert_time_to_seconds) * 1000
+        df = df.drop(columns=["Frame Jitter (ms)"])
+    
+    other_rtp_mask = (~video_screenshare_mask) & df["Type"].str.startswith("RTP")
+    rtp_packets = df[other_rtp_mask].copy()
+    if len(rtp_packets) == 0:
+        print("No audio packets")
+        return df
+    
+    rtp_packets["Inter-Arrival Time (ms)"] = rtp_packets["Inter-Arrival Time (ms)"].apply(convert_time_to_seconds)
+    rtp_packets["Inter-Arrival Time (ms)"] = pd.to_numeric(rtp_packets["Inter-Arrival Time (ms)"], errors='coerce')
+    rtp_packets = rtp_packets.dropna(subset=["Inter-Arrival Time (ms)"])
+    rtp_packets = rtp_packets.sort_values(["Source IP", "Destination IP", "Timestamp"])
+    
+    rtp_packets["Jitter (ms)"] = rtp_packets.groupby(["Source IP", "Destination IP"])["Inter-Arrival Time (ms)"].diff().abs().fillna(0) * 1000
+
+    if "Jitter (ms)" in df.columns:
+        df = df.drop(columns=["Jitter (ms)"])
+    
+    df = df.merge(
+        rtp_packets[["Source IP", "Destination IP", "Timestamp", "Jitter (ms)"]].drop_duplicates(),
+        on=["Source IP", "Destination IP", "Timestamp"], 
+        how="left"
+    )
+    
+    df["Jitter (ms)"] = df["Jitter (ms)"].fillna(0)
+    return df
+
+def calculate_latency(df):
+    if not INTERACTIVE_MODE and "latency" not in args.plot and "combined_network_metrics" not in args.plot:
+        return df
+    
+    if "Latency (One Way)" in df:
+        df["Latency"] = df["Latency (One Way)"].apply(convert_time_to_seconds) * 1000
+        df = df.drop(columns=["Latency (One Way)"])
+        return df
+
+    df["Flags"] = pd.to_numeric(df["Flags"].apply(lambda x: int(x, 16) if isinstance(x, str) else x), errors='coerce').fillna(0).astype(int)
+
+    tcp_packets = df[df["Type"].str.endswith(" TCP")].copy()
+    if len(tcp_packets) == 0:
+        return df
+
+    tcp_packets.loc[:, "Sequence Number"] = pd.to_numeric(tcp_packets["Sequence Number"], errors='coerce')
+    tcp_packets.loc[:, "Ack Number"] = pd.to_numeric(tcp_packets["Ack Number"], errors='coerce')
+
+    syn_packets = tcp_packets[(tcp_packets["Flags"] & FLAG_SYN != 0) & ((tcp_packets["Flags"] & FLAG_ACK) == 0)]
+    syn_ack_packets = tcp_packets[(tcp_packets["Flags"] & FLAG_SYN != 0) & (tcp_packets["Flags"] & FLAG_ACK != 0)]
+
+    if "Latency" not in df.columns:
+        df["Latency"] = None
+
+    for _, syn_packet in syn_packets.iterrows():
+        matching_syn_ack = syn_ack_packets[
+            (syn_ack_packets["Ack Number"] == syn_packet["Sequence Number"] + 1) &
+            (syn_packet["Source IP"] == syn_ack_packets["Destination IP"]) &
+            (syn_packet["Destination IP"] == syn_ack_packets["Source IP"]) &
+            (syn_packet["Source Port"] == syn_ack_packets["Destination Port"]) &
+            (syn_packet["Destination Port"] == syn_ack_packets["Source Port"])
+        ]
+        if not matching_syn_ack.empty:
+            syn_ack_idx = matching_syn_ack.index[0]
+            syn_ack_time = matching_syn_ack.iloc[0]["Timestamp"].time()
+            syn_time = syn_packet["Timestamp"].time()
+            
+            latency = (datetime.combine(datetime.min, syn_ack_time) - datetime.combine(datetime.min, syn_time)).total_seconds()
+            
+            df.loc[syn_ack_idx, "Latency"] = latency * 1000
+
+    return df
+
+def calculate_tcp_retransmissions(df):
+    if not INTERACTIVE_MODE and "tcp_retransmissions" not in args.plot and "combined_network_metrics" not in args.plot:
+        return df
+    
+    if "Retransmission Count" in df.columns:
+        return df
+    
+    tcp_packets = df[df["Type"].str.endswith(" TCP")].copy()
+    if len(tcp_packets) == 0:
+        return df
+    
+    tcp_packets["Retransmission Time Window"] = tcp_packets["Timestamp"].dt.floor("1s")
+    tcp_packets["Is Retransmission"] = tcp_packets.duplicated(
+        subset=["Source IP", "Destination IP", "Source Port", "Destination Port", "Sequence Number"],
+        keep="first"
+    ).astype(int)
+
+    retransmission_counts = tcp_packets.groupby(
+        ["Source IP", "Destination IP", "Retransmission Time Window"]
+    )["Is Retransmission"].sum().reset_index()
+    retransmission_counts.rename(columns={"Is Retransmission": "Retransmission Count"}, inplace=True)
+
+    df = df.copy()
+    df["Retransmission Time Window"] = df["Timestamp"].dt.floor("1s")
+    if "Retransmission Count" in df.columns:
+        df = df.drop(columns=["Retransmission Count"])
+    df = df.merge(
+        retransmission_counts.drop_duplicates(subset=["Source IP", "Destination IP", "Retransmission Time Window"]),
+        on=["Source IP", "Destination IP", "Retransmission Time Window"],
+        how="left"
+    )
+
+    df["Retransmission Count"] = df["Retransmission Count"].fillna(0).astype(int)
+    df = df.drop(columns=["Retransmission Time Window"])
+
+    return df
+
+def calculate_renegotiation_attempts(df):
+    """
+    Identifies the number of ICE renegotiation attempts by counting STUN allocate requests
+    between session initiation (first STUN allocate request) and session establishment 
+    (first media transfer packet), and adds this count to the session establishment row.
+    """
+    if not INTERACTIVE_MODE and "ice_renegotiations" not in args.plot and "combined_network_metrics" not in args.plot:
+        return df
+
+    if 'Renegotiation Attempts' not in df.columns:
+        df['Renegotiation Attempts'] = 0
+
+    session_initiations = df[(df['Type'] == 'Session Setup') & (df['State'] == 'Initiation')]
+    session_establishments = df[(df['Type'] == 'Session Setup') & (df['State'] == 'Established')]
+    stun_allocate_requests = df[(df['Type'] == 'STUN') & (df['Message Type'] == 'Allocate request')]
+    
+    for _, initiation_row in session_initiations.iterrows():
+        initiation_time = initiation_row['Timestamp']
+        source_ip = initiation_row['Source IP']
+        
+        session_establishment = session_establishments[
+            (session_establishments['Timestamp'] >= initiation_time) & 
+            (session_establishments['Source IP'] == source_ip)
+        ].head(1)
+        
+        if not session_establishment.empty:
+            establishment_time = session_establishment.iloc[0]['Timestamp']
+            establishment_time_index = session_establishment.index[0]
+
+            renegotiation_attempts = stun_allocate_requests[
+                (stun_allocate_requests['Timestamp'] > initiation_time) &
+                (stun_allocate_requests['Timestamp'] < establishment_time)
+            ]
+            
+            if len(renegotiation_attempts) > 0:
+                df.at[establishment_time_index, 'Renegotiation Attempts'] = len(renegotiation_attempts)
+
+    return df
+
+def calculate_rtp_packet_loss(df):
+    """
+    Calculate the RTP packet loss rate per media type in discrete 15-second chunks.
+    """
+    rtp_packets = df[df["Type"].str.startswith("RTP")].copy()
+    if rtp_packets.empty:
+        print("No RTP packets found.")
+        return None
+
+    rtp_packets["Sequence Number"] = pd.to_numeric(rtp_packets["Sequence Number"], errors="coerce")
+    rtp_packets = rtp_packets.dropna(subset=["Sequence Number"]).astype({"Sequence Number": int})
+    rtp_packets["Timestamp"] = pd.to_datetime(rtp_packets["Timestamp"])
+    rtp_packets = rtp_packets.sort_values(by=["Source IP", "Destination IP", "SSRC", "Timestamp"]).reset_index(drop=True)
+    rtp_packets = rtp_packets.drop_duplicates(subset=["Source IP", "Destination IP", "SSRC", "Timestamp"])
+
+    media_loss_rates = defaultdict(list)
+    SEQ_NUM_WRAPAROUND = 65536
+    WINDOW_DURATION = pd.Timedelta(seconds=15)
+
+    for (src_ip, dst_ip, ssrc, media_type), group in rtp_packets.groupby(["Source IP", "Destination IP", "SSRC", "Media Type"]):
+        group = group.sort_values("Timestamp").reset_index(drop=True)
+        
+        start_time = group["Timestamp"].iloc[0]
+        end_time = start_time + WINDOW_DURATION
+
+        while start_time < group["Timestamp"].iloc[-1]:
+            window_packets = group[(group["Timestamp"] >= start_time) & (group["Timestamp"] < end_time)]
+            if window_packets.empty:
+                start_time = end_time
+                end_time += WINDOW_DURATION
+                continue
+
+            # Calculate expected packets based on sequence range, accounting for wraparound
+            min_seq_num = window_packets["Sequence Number"].iloc[0]
+            max_seq_num = window_packets["Sequence Number"].iloc[-1]
+            if max_seq_num < min_seq_num:  # handle wraparound
+                expected_packets = (max_seq_num + SEQ_NUM_WRAPAROUND) - min_seq_num + 1
+            else:
+                expected_packets = max_seq_num - min_seq_num + 1
+
+            received_packets = len(window_packets)
+            lost_packets = expected_packets - received_packets
+
+            loss_rate = round((lost_packets / expected_packets) * 100, 5) if expected_packets > 0 else 0
+            media_loss_rates[media_type].append(loss_rate)
+
+            start_time = end_time
+            end_time += WINDOW_DURATION
+
+    summary = {}
+    for media_type, loss_rates in media_loss_rates.items():
+        avg_loss_rate = round(sum(loss_rates) / len(loss_rates), 5) if loss_rates else 0
+        summary[f"{media_type} Packet Loss Rate (%)"] = avg_loss_rate
+        print(f"{media_type} Average Packet Loss Rate: {avg_loss_rate:.5f}%")
+
+    overall_packet_loss_rate = round(
+        sum(sum(loss_rates) for loss_rates in media_loss_rates.values()) /
+        sum(len(loss_rates) for loss_rates in media_loss_rates.values()), 5
+    ) if media_loss_rates else 0
+    summary["Total Packet Loss Rate (All Media Types Combined) (%)"] = overall_packet_loss_rate
+    print(f"Overall Average Packet Loss Rate: {overall_packet_loss_rate:.5f}%")
+
+    return summary
+
+def analyze_high_session_setup_time(df):
+    """
+    Finds rows where "Session Setup Time" exceeds 6 seconds, identifies the next RTP packet
+    with a matching Source IP and a timestamp after the session setup time.
+    Groups matching RTP packets by (Source IP, Destination IP, SSRC, Media Type)
+    and calculates mean jitter for each group.
+    """
+    high_setup_time_rows = df[(df["Session Setup Time"].notnull()) & 
+                              (df["Session Setup Type"] == "Initial Setup") & 
+                              (df["Session Setup Time"] > 6)]
+    
+    print(f'Number of sessions identified with high session setup time: {len(high_setup_time_rows)}')
+
+    if high_setup_time_rows.empty:
+        print("No rows with 'Session Setup Time' > 6 seconds found.")
+        return
+    
+    rtp_packets = df[df["Type"].str.startswith("RTP")].copy()
+    if rtp_packets.empty:
+        print("No RTP packets found.")
+        return
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    rtp_packets["Timestamp"] = pd.to_datetime(rtp_packets["Timestamp"])
+
+    for _, setup_row in high_setup_time_rows.iterrows():
+        setup_time = setup_row["Session Setup Time"]
+        setup_timestamp = setup_row["Timestamp"]
+        source_ip = setup_row["Source IP"]
+
+        matching_rtp_rows = rtp_packets[
+            ((rtp_packets["Source IP"] == source_ip) | (rtp_packets["Destination IP"] == source_ip)) &
+            (rtp_packets["Timestamp"] > setup_timestamp)
+        ]
+
+        if matching_rtp_rows.empty:
+            print(f"No RTP packets found for session setup time {setup_time}s after timestamp {setup_timestamp} with Source IP {source_ip}.")
+            continue
+
+        next_rtp_packet = matching_rtp_rows.iloc[0]
+        ssrc = next_rtp_packet["SSRC"]
+
+        relevant_rtp_packets = rtp_packets[
+            (rtp_packets["SSRC"] == ssrc) &
+            (((rtp_packets["Source IP"] == next_rtp_packet["Source IP"]) & (rtp_packets["Destination IP"] == next_rtp_packet["Destination IP"])) |
+             ((rtp_packets["Source IP"] == next_rtp_packet["Destination IP"]) & (rtp_packets["Destination IP"] == next_rtp_packet["Source IP"])))
+        ]
+
+        for (src_ip, dst_ip, ssrc, media_type), group in relevant_rtp_packets.groupby(["Source IP", "Destination IP", "SSRC", "Media Type"]):
+            mean_jitter = group["Jitter (ms)"].mean()
+            print(f"Session Setup Time: {setup_time}s, Source IP: {src_ip}, Media Type: {media_type}, Mean Jitter: {mean_jitter}ms")
+            calculate_rtp_packet_loss(relevant_rtp_packets)
+
+### INTERACTIVE MODE
+
+def display_menu():
+    print("\n--- Main Menu ---")
+    print("Select an option:")
+    print("P - Plot Data")
+    print("D - Display Data")
+    print("F - Filter Data")
+    print("R - Reset Filter")
+    print("E - Exit")
+
+def plot_menu():
+    print("\n--- Plot Menu ---")
+    print("Available plot types:")
+    for plot_name in plot_functions.keys():
+        print(f"  {plot_name}")
+    print("Enter the plot type you want to generate:")
+
+def display_data(df):
+    print("\n--- Displaying Data ---")
+    print("First 10 rows of the data:")
+    print(df.head(10))
+    print("\nData Columns:")
+    print(df.columns)
+
+def filter_data(df):
+    column_name = input("\nEnter the column name to filter by: ").strip()
+    if column_name not in df.columns:
+        print("Invalid column name.")
+        return df
+
+    filter_value = input(f"Enter the value to filter {column_name} by: ").strip()
+    filtered_df = df[df[column_name] == filter_value]
+    print(f"\nFiltered Data by {column_name} = {filter_value}:")
+    print(filtered_df.head(10))
+    return filtered_df
+
+def interactive_mode(df):
+    print("-" * 80)
+    print(f"--- {'Welcome to Plotter...'.center(72, ' ')} ---")
+    print("-" * 80, end="\n\n")
+
+    print("\nEnter the plot type you want to generate (or 'exit' to quit):", end='\n\n')
+    print(f"Available plot types: {', '.join(plot_functions.keys())}", end="\n\n")
+
+    original = df.copy()
+    while True:
+        display_menu()
+        user_input = input("Choose an option (P/D/F/E/R): ").strip().upper()
+
+        if user_input == 'E':
+            print("Exiting the program.")
+            break
+
+        elif user_input == 'P':
+            plot_menu()
+            plot_type = input("Plot type: ").strip()
+            if plot_type in plot_functions:
+                try:
+                    print(f"\nGenerating plot: {plot_type}")
+                    plot_functions[plot_type](df)
+                except Exception:
+                    print("-" * 80)
+                    print(f"--- {'An error occurred while generating the plot. See stack trace below.'.center(72, ' ')} ---")
+                    print("-" * 80)
+                    traceback.print_exc()
+            else:
+                print("Invalid plot type. Please try again.")
+
+        elif user_input == 'D':
+            display_data(df)
+
+        elif user_input == 'F':
+            df = filter_data(df)
+
+        elif user_input == 'R':
+            df = original
+
+        else:
+            print("Invalid option. Please try again.")
+
+### BASE SETUP
+
+def process_data_and_plot():
+    validate_args()
+    df = prepare_data()
+    df = calculate_metrics(df)
+
+    if INTERACTIVE_MODE:
+        interactive_mode(df)
+    else:
+        generate_plots(df)
+
+def validate_args():
+    global INTERACTIVE_MODE
+    if len(args.plot) > 1 and args.output:
+        raise Exception("output file name should not be specified when multiple plots are being generated")
+    if "all" in args.plot:
+        args.plot = plot_functions.keys()
+    if len(args.plot) == 0:
+        INTERACTIVE_MODE = True
+
+def find_teams_ips(df):
+    combined_ips = pd.concat([df["Source IP"], df["Destination IP"]]).drop_duplicates()
+    valid_ips = combined_ips[combined_ips.apply(lambda ip: is_valid_ip(ip))]
+    result = valid_ips.apply(lambda ip: (ip, str(is_ip_in_teams_ranges(ip)))).dropna().tolist()
+    print(result)
+
+def is_valid_ip(ip):
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+def prepare_data():
+    df = collate_csv_data(args.filenames)
+    timezone = pytz.timezone(args.timezone)
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"].str.replace(r" [A-Z]+$", "", regex=True), format="%Y-%m-%d %H:%M:%S.%f %z", errors="coerce")
+    df["Timestamp"] = df["Timestamp"].dt.tz_convert(timezone).dt.tz_localize(None)
+    df = df.dropna(subset=["Timestamp"])
+
+    if args.peakhour:
+        df = df[(df["Timestamp"].dt.weekday < 5) &  # Weekdays only (0=Monday, 4=Friday)
+                (df["Timestamp"].dt.time >= pd.to_datetime("08:00:00").time()) &
+                (df["Timestamp"].dt.time <= pd.to_datetime("18:00:00").time())]
+
+    start_time = df["Timestamp"].min()
+    df["Relative Time"] = (df["Timestamp"] - start_time).dt.total_seconds()
+    df["Millis"] = (df["Relative Time"] * 1000).astype(int)
+
+    return df
+
+def calculate_metrics(df):
+    df = calculate_setup_times(df, args.threshold)
+    df = calculate_rtp_jitter(df)
+    df = calculate_latency(df)
+    df = calculate_tcp_retransmissions(df)
+    df = calculate_renegotiation_attempts(df)
+    return df
+
+def filter_flow_types(df):
+    flow_type_mapping = {
+        "dns": [ftype for ftype in df["Type"].unique() if ftype.startswith("DNS")],
+        "udp": [ftype for ftype in df["Type"].unique() if ftype.endswith(" UDP")],
+        "upstream_udp": [ftype for ftype in df["Type"].unique() if ftype == "Upstream UDP"],
+        "downstream_udp": [ftype for ftype in df["Type"].unique() if ftype == "Downstream UDP"],
+        "tcp": [ftype for ftype in df["Type"].unique() if ftype.endswith(" TCP")],
+        "upstream_tcp": [ftype for ftype in df["Type"].unique() if ftype == "Upstream TCP"],
+        "downstream_tcp": [ftype for ftype in df["Type"].unique() if ftype == "Downstream TCP"],
+        "stun": [ftype for ftype in df["Type"].unique() if ftype.startswith("STUN")],
+        "rtp": [ftype for ftype in df["Type"].unique() if ftype.startswith("RTP ")],
+        "rtp_audio": [ftype for ftype in df["Type"].unique() if ftype == "RTP Audio"],
+        "rtp_video": [ftype for ftype in df["Type"].unique() if ftype == "RTP Video"],
+        "rtp_screenshare": [ftype for ftype in df["Type"].unique() if ftype == "RTP ScreenShare"],
+        "rtcp": [ftype for ftype in df["Type"].unique() if ftype.startswith("RTCP")],
+        "session_setup": [ftype for ftype in df["Type"].unique() if ftype.startswith("Session Setup")],
+        "all": df["Type"].unique()
+    }
+
+    selected_flow_types = flow_type_mapping["all"] if "all" in args.flows else [
+        ftype for flow_type in args.flows for ftype in flow_type_mapping.get(flow_type, [])
+    ]
+    return df[df["Type"].isin(selected_flow_types)]
+
+def generate_plots(df, use_multiprocessing=False):
+    Executor = concurrent.futures.ProcessPoolExecutor if use_multiprocessing else concurrent.futures.ThreadPoolExecutor
+    with Executor() as executor:
+        futures = []
+        for plot_type in args.plot:
+            if plot_type in plot_functions:
+                print(f"Generating plot: {plot_type}")
+                futures.append(executor.submit(plot_functions[plot_type], df))
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print("-" * 80)
+                print(f"--- {'An error occurred while generating a plot. See stack trace below.'.center(72, ' ')} ---")
+                print("-" * 80, end="\n\n")
+                traceback.print_exc()      
+
+if __name__ == "__main__":
+    global args, plot_functions
+    plot_functions = {
+        "volumetric_flows": plot_volumetric_flows,
+        "call_flow": plot_call_flow,
+        "call_flow_session_setup": plot_call_flow_session_setup,
+        "session_setup": plot_session_setup,
+        "session_setup_by_os": plot_session_setup_by_os,
+        "session_setup_k_means": plot_session_setup_k_means,
+        "session_setup_time_based": plot_session_setup_time_based,
+        "media_distribution": plot_media_type_distribution,
+        "media_flow_distribution": plot_media_flow_distribution,
+        "session_setup_over_day": plot_setup_time_over_day,
+        "session_stage_durations": plot_session_stage_durations,
+        "abandonment_rate": plot_abandonment_rate,
+        "rtp_jitter": plot_rtp_jitter,
+        "latency": plot_latency,
+        "tcp_retransmissions": plot_tcp_retransmissions,
+        "combined_network_metrics": plot_combined_network_metrics,
+        "bandwidth": plot_bandwidth,
+        "ice_renegotiations": plot_ice_renegotiations,
+        "media_types_in_calls": plot_media_types_in_calls,
+        "rtp_packet_loss": plot_rtp_packet_loss_rate,
+        "rtp_latency": plot_rtp_latency,
+        "session_count": plot_session_count,
+        "high_session": analyze_high_session_setup_time,
+        "teams_ips": find_teams_ips,
+        "signalling_load": plot_session_signalling_load,
+    }
+
+    parser = argparse.ArgumentParser(description="Generate a timeseries plot of packets per second from CSV files.")
+    parser.add_argument("filenames", nargs="+", help="Paths to the CSV files containing session setup times")
+    parser.add_argument("-o", "--output", type=str, help="Name of the output file to save the plot (e.g., output.png)")
+    parser.add_argument("-f", "--flows", nargs="+", choices=["rtp", "rtp_video", "rtp_audio", "rtp_screenshare", "rtcp", "stun", "udp", "upstream_udp", "downstream_udp", "tcp", "upstream_tcp", "downstream_tcp", "dns", "session_setup", "all"], 
+                        default=["all"], help="Specify which flow types to include in the plot.")
+    parser.add_argument("-p", "--plot", nargs="+", default=[], choices=plot_functions.keys(), help="Specify the type(s) of plot to generate.")
+    parser.add_argument("-tz", "--timezone", type=str, default="Australia/Sydney", 
+                    help="Specify the timezone for the data, e.g., 'Australia/Sydney' (default: AEST).")
+    parser.add_argument("-ph", "--peakhour", action="store_true", help="Only filter for traffic captured between 8am - 6pm on weekdays.")
+    parser.add_argument("-t", "--threshold", type=int, default=300, help="Time threshold used to separate initial call session setups and subsequent media channel session setups")
+    parser.add_argument("-m", "--method", type=int, default=2, choices=[1, 2], help="Method used to calculate session setup time. [1] DNS-based, [2] STUN-based.")
+    parser.add_argument("-mp", "--multiprocessing", action="store_false", help="Enable multiprocessing.")
+
+    try:
+        args = parser.parse_args()
+        process_data_and_plot()
+    except FileNotFoundError as e:
+        print("Error: Could not find one of the specified files. Please check the filenames and try again.")
+    except UnicodeDecodeError as e:
+        print("Error: Could not decode file. Please check the filenames and try again.")
+    except Exception as e:
+        print("-" * 80)
+        print(f"--- {'An unexpected error occurred. See stack trace below.'.center(72, ' ')} ---")
+        print("-" * 80, end="\n\n")
+        traceback.print_exc()
