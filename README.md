@@ -75,7 +75,7 @@ pip install -r requirements.txt
 **Running the tool**
 
 ```bash
-./plotter <csv_files> --option 1 --flow_types RTP STUN --output "output.png"
+./plotter <csv_files> --flow_types RTP STUN --output "output.png"
 ```
 
 
@@ -98,7 +98,7 @@ Plot volumetric flows for RTP and STUN traffic:
 Generate a session setup time plot:
 
 ```bash
-./plotter logs.csv --option 3 --plot session_setup_time_based
+./plotter logs.csv --plot session_setup_time_based
 ```
 
 ### License
